@@ -1,0 +1,10 @@
+.DS_Store
+node_modules/
+.env
+.env.*
+*.pem
+*.key
+*.log
+*.zip
+.codex/
+/api-key.local.js

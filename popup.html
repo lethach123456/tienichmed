@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link rel="stylesheet" href="popup.css">
+  <title>MedReview AI content</title>
+</head>
+<body>
+  <main class="app-shell">
+    <header class="app-header">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M7 5h8l3 3v11H7z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M10 10h5m-5 3h5m-5 3h3M4 8v13h11" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></div>
+        <div class="brand-copy"><span class="eyebrow">TRỢ LÝ NỘI DUNG</span><h1>MedReview AI content</h1></div>
+      </div>
+      <button id="settingsToggle" class="icon-button" title="Cài đặt API" aria-label="Cài đặt API" aria-haspopup="dialog"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M4 7h16M4 17h16"/><rect x="8" y="4" width="4" height="6" rx="2" fill="currentColor"/><rect x="14" y="14" width="4" height="6" rx="2" fill="currentColor"/></svg></button>
+    </header>
+    <div id="statusLine" class="status-line" data-state="ready" role="status" aria-live="polite"><span class="status-dot" aria-hidden="true"></span><span id="status">Sẵn sàng</span></div>
+    <div class="workspace">
+      <section class="card system-card" aria-labelledby="systemHeading">
+        <div class="section-title"><div class="section-label"><h2 id="systemHeading">Thông báo hệ thống</h2></div><span id="systemClock" class="section-kicker"></span></div>
+        <strong id="systemPhase" role="status" aria-live="polite">Sẵn sàng</strong>
+        <p id="systemDetail">Chưa có tác vụ đang chạy trên tab này.</p>
+        <p id="systemCountdown" class="system-countdown" hidden></p>
+        <details class="system-history"><summary>Các bước gần đây</summary><ol id="systemHistory"></ol></details>
+      </section>
+      <section class="card queue-card" aria-labelledby="queueHeading">
+        <div class="section-title">
+          <div class="section-label"><h2 id="queueHeading">Danh sách bài</h2><small id="queueCount" class="count">0</small></div>
+          <div class="section-actions">
+            <button id="refresh" class="icon-button" title="Tải lại danh sách" aria-label="Tải lại danh sách"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 7v5h-5M4 17v-5h5M5.6 7a7 7 0 0 1 11.6-1L20 9M4 15l2.8 3a7 7 0 0 0 11.6-1"/></svg></button>
+            <button id="clear" class="icon-button danger-hover" title="Xoá hết danh sách" aria-label="Xoá hết danh sách"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 10v6m4-6v6"/></svg></button>
+          </div>
+        </div>
+        <label class="source-picker">Nguồn tác vụ<select id="sourceType"><option value="facility">Cơ sở y tế</option><option value="doctor">Viết hồ sơ bác sĩ</option><option value="facility_image_fix">Fix ảnh cơ sở y tế</option><option value="toplist">Toplist</option><option value="ai-image">Tạo ảnh AI</option><option value="translation">Dịch Việt → Anh</option></select></label>
+        <label id="translationTypeWrap" class="source-picker" hidden>Loại dữ liệu<select id="translationType"><option value="facility">Cơ sở y tế</option><option value="doctor">Bác sĩ</option><option value="toplist">Toplist</option></select></label>
+        <p id="providerCapabilityHint" class="provider-capability-hint" role="status" hidden></p>
+        <div id="items" class="list-scroll queue-list"></div>
+      </section>
+      <section class="card results-card" aria-labelledby="resultsHeading">
+        <div class="section-title"><div class="section-label"><h2 id="resultsHeading">Kết quả đã viết</h2><small id="resultCount" class="count">0</small></div><span id="resultsKicker" class="section-kicker">JSON</span></div>
+        <p class="history-retention-note">Giữ 2 bài đã gửi thành công gần nhất. Bài gửi lỗi giữ lại để gửi lại.</p>
+        <div id="results" class="list-scroll"></div>
+        <pre id="resultViewer" hidden></pre>
+      </section>
+      <section class="card api-status-card" aria-labelledby="apiHeading">
+        <div class="section-title"><div class="section-label"><h2 id="apiHeading">Gửi lên website</h2><small id="apiCount" class="count">0</small></div><span class="section-kicker">API</span></div>
+        <div id="apiStatus" class="list-scroll"></div>
+      </section>
+    </div>
+    <footer class="run-actions">
+      <div class="run-summary"><span id="runCaption">Sẵn sàng</span><small id="runDetail">Chưa có bài trong hàng đợi</small></div>
+      <div class="provider-actions">
+        <button id="runToggle" class="provider-run" type="button" aria-label="Chạy trên tab AI này">
+          <span class="provider-dot" aria-hidden="true"></span>
+          <span id="runProvider" class="provider-label">AI</span>
+          <span class="run-separator" aria-hidden="true"></span>
+          <span id="runLabel" class="run-command">Chạy</span>
+        </button>
+      </div>
+    </footer>
+  </main>
+  <section id="settings" class="settings-modal modal" role="dialog" aria-modal="true" aria-labelledby="settingsTitle" hidden>
+    <div class="settings-sheet">
+      <div class="dialog-header"><div class="dialog-heading"><span class="eyebrow">KẾT NỐI WEBSITE</span><h2 id="settingsTitle">Cài đặt API</h2></div><button id="closeSettings" class="icon-button" aria-label="Đóng cài đặt" title="Đóng">×</button></div>
+      <div class="settings-body">
+        <div class="settings-group"><h3><span class="group-number">01</span>Cơ sở y tế</h3>
+          <label>URL lấy danh sách bài<input id="facilitiesUrl" type="url" spellcheck="false" autocomplete="off"></label>
+          <label>URL nhận JSON cơ sở<input id="updateUrl" type="url" spellcheck="false" autocomplete="off"></label>
+        </div>
+        <div class="settings-group"><h3><span class="group-number">02</span>Hồ sơ bác sĩ</h3>
+          <label>URL lấy bác sĩ cần nghiên cứu<input id="doctorsUrl" type="url" spellcheck="false" autocomplete="off"></label>
+          <label>URL nhận JSON hồ sơ bác sĩ<input id="doctorUpdateUrl" type="url" spellcheck="false" autocomplete="off"></label>
+          <label>URL kiểm tra hồ sơ đã lưu<input id="doctorContentUrl" type="url" spellcheck="false" autocomplete="off"></label>
+          <p class="settings-help">Dùng prompt của từng bác sĩ từ API. Kết quả thiếu bằng chứng được lưu thành nghiên cứu thiếu dữ liệu, không tự viết lại; hồ sơ luôn chờ duyệt.</p>
+        </div>
+        <div class="settings-group"><h3><span class="group-number">03</span>Toplist</h3>
+          <label>URL lấy danh sách Toplist<input id="toplistsUrl" type="url" spellcheck="false" autocomplete="off"></label>
+          <label>URL nhận JSON Toplist<input id="toplistUpdateUrl" type="url" spellcheck="false" autocomplete="off"></label>
+        </div>
+        <div class="settings-group image-settings-group"><h3><span class="group-number">04</span>Ảnh AI</h3>
+          <label>URL lấy cơ sở có gallery đủ ảnh<input id="aiImagesUrl" type="url" spellcheck="false" autocomplete="off"></label>
+          <label>URL nhận ảnh AI<input id="aiImageUpdateUrl" type="url" spellcheck="false" autocomplete="off"></label>
+          <p class="settings-help">Lấy cơ sở có gallery_json từ 3 ảnh làm tham chiếu (API đính kèm tối đa 4 ảnh). API mặc định bỏ qua cơ sở đã có ảnh AI để tránh tạo lặp; ảnh AI lưu riêng, không ghi đè ảnh gốc.</p>
+        </div>
+        <div class="settings-group"><h3><span class="group-number">05</span>Dịch Việt → Anh</h3>
+          <label>URL lấy prompt và lưu bản dịch nháp<input id="translationUrl" type="url" spellcheck="false" autocomplete="off"></label>
+          <p class="settings-help">Dùng chung endpoint translate-content.php cho GET danh sách theo loại dữ liệu và POST bản dịch. `type` và `source_id` được giữ nguyên theo từng bài.</p>
+        </div>
+        <div class="settings-group"><h3><span class="group-number">06</span>Fix ảnh cơ sở y tế</h3>
+          <label>URL lấy cơ sở cần kiểm tra ảnh<input id="facilityImageFixUrl" type="url" spellcheck="false" autocomplete="off"></label>
+          <label>URL nhận kết quả kiểm tra ảnh<input id="facilityImageFixUpdateUrl" type="url" spellcheck="false" autocomplete="off"></label>
+          <p class="settings-help">Kiểm tra ảnh hiện có và bổ sung ảnh thật từ web, không tạo ảnh AI. Website nhận JSON trước; worker tải và kiểm tra ảnh bổ sung sau.</p>
+        </div>
+        <div class="settings-group"><h3><span class="group-number">07</span>Nhận diện máy và tài khoản AI</h3>
+          <label>Tên máy / vị trí<input id="instanceLabel" type="text" maxlength="80" autocomplete="off" placeholder="Ví dụ: Máy văn phòng"></label>
+          <label>Nhãn tài khoản AI<input id="accountLabel" type="text" maxlength="80" autocomplete="off" placeholder="Ví dụ: Gemini nội dung"></label>
+          <p class="settings-help">Dùng nhãn tự đặt để nhận biết máy/tài khoản đang giữ bài. Tiện ích không đọc email, cookie hoặc thông tin đăng nhập.</p>
+        </div>
+      </div>
+      <div class="dialog-footer"><span id="settingsMessage" role="status"></span><button id="saveSettings" class="settings-save">Lưu cấu hình</button></div>
+    </div>
+  </section>
+  <div id="jsonModal" class="json-modal modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle" hidden>
+    <div class="json-dialog">
+      <div class="dialog-header">
+        <div class="dialog-heading"><h2 id="modalTitle">Kết quả JSON</h2><p id="modalSubtitle"></p></div>
+        <div class="dialog-actions"><button id="copyJson" class="icon-button" aria-label="Sao chép nội dung" title="Sao chép nội dung"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="8" y="8" width="12" height="12" rx="3"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg></button><button id="closeJson" class="icon-button" aria-label="Đóng nội dung" title="Đóng">×</button></div>
+      </div>
+      <pre id="modalJson" tabindex="0"></pre>
+    </div>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>

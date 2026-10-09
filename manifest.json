@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "MedReview AI content",
+  "version": "1.6.4",
+  "description": "Viết nội dung cơ sở y tế, hồ sơ bác sĩ, Toplist, dịch bài, tạo ảnh AI và kiểm tra/sửa ảnh thật; đồng bộ về API.",
+  "permissions": ["storage", "tabs", "scripting", "alarms"],
+  "host_permissions": ["https://chatgpt.com/*", "https://grok.com/*", "https://*.x.com/*", "https://claude.ai/*", "https://gemini.google.com/*", "<all_urls>"],
+  "background": { "service_worker": "background.js", "type": "module" },
+  "action": { "default_title": "MedReview AI content", "default_popup": "popup.html" },
+  "content_scripts": [
+    {
+      "matches": ["https://chatgpt.com/*", "https://grok.com/*", "https://*.x.com/*", "https://claude.ai/*", "https://gemini.google.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["popup.html", "popup.js", "popup.css"],
+      "matches": ["https://chatgpt.com/*", "https://grok.com/*", "https://x.com/*", "https://*.x.com/*", "https://claude.ai/*", "https://gemini.google.com/*"]
+    }
+  ]
+}
