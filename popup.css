@@ -131,6 +131,27 @@ svg { pointer-events: none; }
 .icon-button:active { transform: scale(.95); }
 .icon-button.danger-hover:hover { color: var(--danger); background: var(--danger-soft); }
 
+.queue-load-error {
+  margin: 10px 0;
+  padding: 12px;
+  border: 1px solid var(--danger);
+  border-radius: 12px;
+  background: var(--danger-soft);
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+.queue-load-error strong { display: block; color: var(--danger); font-size: 13px; }
+.queue-load-error p { margin: 8px 0; font-size: 12px; white-space: pre-wrap; }
+.queue-load-error summary { cursor: pointer; color: var(--muted); padding: 4px 0; }
+.queue-retry {
+  min-height: 44px; padding: 8px 16px; margin-top: 8px;
+  border: 1px solid var(--line-strong); border-radius: 10px;
+  background: var(--surface-strong); color: var(--text); cursor: pointer;
+}
+.queue-retry:hover { background: var(--surface-hover); }
+.queue-retry:focus-visible { outline: 2px solid var(--text); outline-offset: 3px; }
+.queue-retry:disabled { opacity: .55; cursor: wait; }
+
 .status-line {
   min-height: 28px;
   flex: 0 0 auto;

@@ -146,6 +146,45 @@ function tabSettingsKey() {
   return panelContext.targetTabId ? `tab-api-settings:${panelContext.targetTabId}` : null;
 }
 
+function doctorQueueStateKey() { return `tab-doctor-queue:${panelContext.targetTabId || "legacy"}`; }
+function isStorageQuotaError(error) {
+  return error?.storageError === true || error?.code === "storage_quota_exceeded" || error?.errorCode === "storage_quota_exceeded" ||
+    /kQuotaBytes|QUOTA_BYTES|storage.{0,30}quota.{0,30}exceeded/i.test(String(error?.message || error || ""));
+}
+function storageQuotaFailure() {
+  return { storageError: true, code: "storage_quota_exceeded", status: "error", httpStatus: null, schemaUnavailable: false,
+    message: "Bộ nhớ lưu dữ liệu của tiện ích đã vượt giới hạn Chrome, không phải lỗi API.",
+    help: "Cập nhật tiện ích rồi bấm Tải lại (Reload) tại chrome://extensions để áp dụng quyền lưu trữ mới; sau đó tải lại tab AI và bấm Thử lại. Không gỡ tiện ích hoặc xóa dữ liệu: JSON đang chờ/gửi lỗi cần được giữ lại." };
+}
+function doctorQueueError() {
+  const failure = selectedSourceType() === "doctor" && state.doctorQueueState?.status === "error" ? state.doctorQueueState : null;
+  // Recover old installations that persisted the raw quota exception as an
+  // API error. Never repeat their stale API/configuration instructions.
+  return failure && isStorageQuotaError(failure) ? storageQuotaFailure() : failure;
+}
+function queueLoadFailure() { return state.storageFailure || doctorQueueError(); }
+function doctorQueueFailure(error) {
+  if (isStorageQuotaError(error)) return { ...storageQuotaFailure(), sourceType: "doctor" };
+  const httpStatus = Number(error?.httpStatus) || Number(String(error?.message || "").match(/HTTP\s+(\d{3})/)?.[1]) || null;
+  return { sourceType: "doctor", status: "error", httpStatus, schemaUnavailable: httpStatus === 503,
+    message: String(error?.message || "Không tải được hồ sơ bác sĩ."),
+    help: httpStatus === 503
+      ? "Quản trị website: kiểm tra DB/schema và bản deploy; chạy php scripts/migrate_doctor_content.php trên đúng DB server. API sẵn sàng rồi bấm Thử lại. Tiện ích không tự chạy migration."
+      : "Kiểm tra kết nối, endpoint và quyền API trong cấu hình rồi bấm Thử lại. JSON đã lưu vẫn được giữ." };
+}
+function renderDoctorQueueError() {
+  const failure = queueLoadFailure();
+  const box = $("queueLoadError");
+  if (!box) return;
+  box.hidden = !failure;
+  if (!failure) return;
+  $("queueErrorTitle").textContent = failure.storageError ? "Bộ nhớ tiện ích đã đầy" : "Không tải được hồ sơ bác sĩ";
+  $("queueErrorMessage").textContent = failure.message;
+  $("queueErrorHelp").textContent = failure.help || doctorQueueFailure({ message: failure.message, httpStatus: failure.httpStatus }).help;
+  $("queueRetry").disabled = loadingArticles || currentTabIsRunning();
+  $("queueRetry").textContent = loadingArticles ? "Đang thử lại…" : "Thử lại";
+}
+
 function panelOwnsItem(item) {
   const owner = Number(item.ownerTabId || item.workerTabId);
   return !owner || owner === panelContext.targetTabId;
@@ -186,6 +225,7 @@ function imageProviderMessage(provider) {
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "local") return;
   let changed = false;
+  if (changes[doctorQueueStateKey()]) { state.doctorQueueState = changes[doctorQueueStateKey()].newValue; changed = true; }
   const tabItemsChange = changes[tabItemsKey()];
   if (tabItemsChange) { state.items = tabItemsChange.newValue || []; state.tabItemsInitialized = true; changed = true; }
   else if (changes.items && !state.tabItemsInitialized) { state.items = (changes.items.newValue || []).filter(panelOwnsItem); changed = true; }
@@ -216,7 +256,8 @@ async function init() {
   const preferenceKey = tabSourcePreferenceKey();
   const itemsKey = tabItemsKey();
   const settingsKey = tabSettingsKey();
-  state = await chrome.storage.local.get(["items", "runner", "systemNotices", "sourceType", "translationType", "instance_label", "account_label", ...Object.keys(API_SETTINGS), ...(preferenceKey ? [preferenceKey, itemsKey, settingsKey] : [])]);
+  state = await chrome.storage.local.get(["items", "runner", "systemNotices", "sourceType", "translationType", "instance_label", "account_label", doctorQueueStateKey(), ...Object.keys(API_SETTINGS), ...(preferenceKey ? [preferenceKey, itemsKey, settingsKey] : [])]);
+  state.doctorQueueState = state[doctorQueueStateKey()];
   if (settingsKey) Object.assign(state, state[settingsKey] || {});
   state.tabItemsInitialized = Boolean(itemsKey && Object.hasOwn(state, itemsKey));
   state.items = state.tabItemsInitialized ? state[itemsKey] || [] : (state.items || []).filter(panelOwnsItem);
@@ -244,7 +285,7 @@ async function init() {
   $("translationType").disabled = currentTabIsRunning();
   render();
   updateRunButton();
-  if (!currentTabIsRunning() && !state.items.some(panelItemMatchesSource)) loadArticles();
+  if (!currentTabIsRunning() && !queueLoadFailure() && !state.items.some(panelItemMatchesSource)) loadArticles();
 }
 
 async function resolvePanelContext() {
@@ -271,6 +312,7 @@ async function resolvePanelContext() {
 async function loadArticles() {
   if (loadingArticles) return;
   loadingArticles = true;
+  renderDoctorQueueError();
   updateRunButton();
   const sourceType = selectedSourceType();
   const { pluralLabel: label } = sourceInfo(sourceType);
@@ -280,15 +322,28 @@ async function loadArticles() {
     const request = { type: "refresh-queue", sourceType, targetTabId: panelContext.targetTabId };
     if (sourceType === "translation") request.translationType = translationType;
     const data = await chrome.runtime.sendMessage(request);
-    if (!data?.ok) throw new Error(data?.error || "Không lấy được danh sách.");
+    if (!data?.ok) {
+      const error = new Error(data?.error || "Không lấy được danh sách.");
+      error.httpStatus = data?.httpStatus;
+      error.queueState = data?.queueState;
+      error.storageError = data?.storageError;
+      error.errorCode = data?.errorCode;
+      throw error;
+    }
+    delete state.storageFailure;
+    if (sourceType === "doctor") state.doctorQueueState = data.queueState || { sourceType: "doctor", status: "ready", httpStatus: 200 };
     state.items = (data.items || state.items).filter(panelOwnsItem);
     render();
     const missingLabel = sourceType === "facility_image_fix" ? "cơ sở thiếu ID, prompt hoặc dữ liệu ảnh hợp lệ" : sourceType === "ai-image" ? "cơ sở không có ID/prompt" : sourceType === "translation" ? "mục dịch thiếu source_id, prompt hoặc schema" : "bài thiếu ID/prompt";
     const queueErrors = sourceType === "facility_image_fix" && data.errors?.length
       ? ` · ${data.errors.length} lỗi nguồn: ${data.errors.map((entry) => `ID ${entry.id}: ${entry.message}`).join("; ").slice(0, 350)}` : "";
     setStatus(`Đã thêm ${data.added} ${label}${data.skipped ? ` · ${data.skipped} ${missingLabel}` : ""}${queueErrors}`, data.skipped > 0 || Boolean(queueErrors));
-  } catch (error) { setStatus(error.message, true); }
-  finally { loadingArticles = false; updateRunButton(); }
+  } catch (error) {
+    if (isStorageQuotaError(error) || isStorageQuotaError(error.queueState)) state.storageFailure = storageQuotaFailure();
+    if (sourceType === "doctor") state.doctorQueueState = state.storageFailure || error.queueState || doctorQueueFailure(error);
+    setStatus(state.storageFailure?.message || error.message, true);
+  }
+  finally { loadingArticles = false; render(); }
 }
 
 function articleSource(item) {
@@ -589,9 +644,10 @@ function displayImageResult(item) {
 }
 
 function render() {
+  renderDoctorQueueError();
   renderSystemNotice();
   updateSourcePresentation();
-  const nextKey = JSON.stringify([selectedSourceType(), selectedTranslationType(), currentTabIsRunning(), panelIsRefilling(),
+  const nextKey = JSON.stringify([selectedSourceType(), selectedTranslationType(), currentTabIsRunning(), panelIsRefilling(), queueLoadFailure()?.code || Boolean(queueLoadFailure()),
     (state.items || []).map((item) => [item.id, item.title, item.status, item.provider, item.workerKey, articleSource(item), item.type, item.source_id, hasSavedResult(item), item.content_version, item.writer_claimed, item.writer_claim, isFacilityImageFixJob(item) ? [imageFixImageCount(item), item.images_revision, item.image_fix_error_code] : null, promptDebugLabel(item)])]);
   if (queueLayoutKey !== nextKey) {
   queueLayoutKey = nextKey;
@@ -604,8 +660,8 @@ function render() {
     const imageFixMode = selectedSourceType() === "facility_image_fix";
     const translationMode = selectedSourceType() === "translation";
     const hasHistory = state.items?.some(panelItemMatchesSource);
-    const title = panelIsRefilling() ? (imageMode || imageFixMode ? "Đang tải thêm cơ sở" : "Đang tải thêm bài") : hasHistory ? "Đã xử lý hết" : imageFixMode ? "Chưa có cơ sở cần Fix ảnh" : imageMode ? "Chưa có cơ sở có gallery đủ ảnh" : translationMode ? "Chưa có mục cần dịch" : "Chưa có bài";
-    const detail = panelIsRefilling() ? "Tiện ích đang gọi lại API của nguồn đã chọn." : hasHistory ? "Kết quả vẫn được lưu ở các mục bên dưới." : imageFixMode ? "Tải danh sách để kiểm tra ảnh hiện tại bằng prompt của website." : imageMode ? "Chọn Tạo ảnh AI để tải cơ sở có gallery từ website." : translationMode ? `Chọn loại dữ liệu (${selectedTranslationType()}) rồi tải prompt dịch từ website.` : "Chọn nguồn rồi tải danh sách từ website.";
+    const title = queueLoadFailure() ? "Chưa tải được danh sách" : panelIsRefilling() ? (imageMode || imageFixMode ? "Đang tải thêm cơ sở" : "Đang tải thêm bài") : hasHistory ? "Đã xử lý hết" : imageFixMode ? "Chưa có cơ sở cần Fix ảnh" : imageMode ? "Chưa có cơ sở có gallery đủ ảnh" : translationMode ? "Chưa có mục cần dịch" : "Chưa có bài";
+    const detail = queueLoadFailure()?.storageError ? "Đây là lỗi bộ nhớ Chrome, không phải lỗi API hay hết bài. Reload tiện ích và tab AI rồi bấm Thử lại; không xóa JSON đã lưu." : doctorQueueError() ? "Đây là lỗi tải API, không phải hết bác sĩ cần nghiên cứu. Bấm Thử lại khi website sẵn sàng." : panelIsRefilling() ? "Tiện ích đang gọi lại API của nguồn đã chọn." : hasHistory ? "Kết quả vẫn được lưu ở các mục bên dưới." : imageFixMode ? "Tải danh sách để kiểm tra ảnh hiện tại bằng prompt của website." : imageMode ? "Chọn Tạo ảnh AI để tải cơ sở có gallery đủ ảnh từ website." : translationMode ? `Chọn loại dữ liệu (${selectedTranslationType()}) rồi tải prompt dịch từ website.` : "Chọn nguồn rồi tải danh sách từ website.";
     box.innerHTML = emptyState("inbox", title, detail);
   }
   queueEntries.forEach(({ item, index }, position) => {
@@ -688,6 +744,17 @@ function render() {
   renderApiStatus();
   updateRunButton();
 }
+function doctorUrlRepairGuide(item) {
+  const error = item.api_error || item.error || "";
+  if (articleSource(item) !== "doctor" || !/URL|website_url|booking_url|image_url/i.test(error)) return "";
+  return `\n\nHướng dẫn sửa JSON bằng AI (chưa tự gửi):\n` +
+    `Hãy sửa TOÀN BỘ JSON hồ sơ bác sĩ có id ${item.doctor_id}, name ${JSON.stringify(item.name ?? item.title)}. Giữ nguyên id, name và các trường dữ liệu/chứng cứ đã có; chỉ sửa giá trị sai kiểu/định dạng URL được báo ở trên.\n` +
+    `URL phải là chuỗi HTTP(S) thô, không Markdown/HTML, object, mảng, số, boolean hoặc chuỗi "null". Các URL tùy chọn có thể là null khi không có bằng chứng; không suy đoán hay tạo URL.\n` +
+    `website_url, booking_url, image_url, professional_profile_url, practice_registry_url là chuỗi URL hoặc null. Mọi khóa url/website_url/booking_url lồng trong JSON cũng phải đúng kiểu này.\n` +
+    `gallery_json[i].url và sources_json[i].url bắt buộc là URL thật không rỗng, không null. social_links_json ưu tiên object nền tảng:CHUỖI URL (hoặc []); tiện ích cũng nhận danh sách object chỉ gồm platform và url, giữ tên nền tảng (bỏ khoảng trắng ngoài), không trùng/trống, URL phải là chuỗi HTTP(S) thật. video_urls_json là mảng CHUỖI URL. Không đổi object URL thành chuỗi JSON, không tự chọn URL từ object nhiều trường, không xoá ảnh/nguồn/chứng cứ để che lỗi; nếu không xác minh được, báo thiếu dữ liệu để biên tập viên xem xét.\n` +
+    `Chỉ trả toàn bộ JSON đã sửa trong một block code json, không rút gọn các trường khác và không thêm claim token/khóa API. JSON gốc trong tiện ích vẫn được giữ nguyên; gửi lại JSON cũ sẽ vẫn bị chặn nếu chưa sửa.`;
+}
+
 function renderApiStatus() {
   const box = $("apiStatus");
   const items = (state.items || []).filter((item) => panelItemMatchesSource(item) && ["hoàn tất", "ảnh chưa đủ", "lỗi cập nhật", "đang cập nhật", "chưa xác nhận", "lỗi"].includes(item.status));
@@ -757,7 +824,15 @@ function renderApiStatus() {
       row.querySelector(".api-name")?.setAttribute("title", detail);
     } : null;
     if (update) apiElapsedUpdaters.push(update);
-    if (!success && item.status !== "đang cập nhật") { const icon = row.querySelector(".api-state"); icon.style.cursor = "pointer"; icon.onclick = (event) => { event.stopPropagation(); openViewer(uncertain ? "Chưa xác nhận gửi website" : imageFixJob ? "Lỗi Fix ảnh cơ sở y tế" : item.status === "lỗi" ? (imageJob ? "Lỗi tạo ảnh AI" : "Lỗi đọc kết quả AI") : "Mã lỗi gửi website", `${imageJob || imageFixJob ? "Cơ sở" : "Bài"}: ${item.title || (imageJob ? "Ảnh AI" : "Bài viết")}\nTrạng thái: ${displayJobStatus(item)}\nLỗi: ${imageFixJob ? imageFixErrorDetail(item) : item.api_error || item.error || "Không xác định"}`, displayArticleTitle(item)); }; }
+    if (!success && item.status !== "đang cập nhật") {
+      const icon = row.querySelector(".api-state");
+      icon.style.cursor = "pointer";
+      icon.onclick = (event) => {
+        event.stopPropagation();
+        openViewer(uncertain ? "Chưa xác nhận gửi website" : imageFixJob ? "Lỗi Fix ảnh cơ sở y tế" : item.status === "lỗi" ? (imageJob ? "Lỗi tạo ảnh AI" : "Lỗi đọc kết quả AI") : "Mã lỗi gửi website",
+          `${imageJob || imageFixJob ? "Cơ sở" : "Bài"}: ${item.title || (imageJob ? "Ảnh AI" : "Bài viết")}\nTrạng thái: ${displayJobStatus(item)}\nLỗi: ${imageFixJob ? imageFixErrorDetail(item) : item.api_error || item.error || "Không xác định"}${doctorUrlRepairGuide(item)}`, displayArticleTitle(item));
+      };
+    }
     row.querySelector(".image-errors")?.addEventListener("click", (event) => { event.stopPropagation(); openViewer("Chi tiết ảnh không được lưu", imageFixJob ? imageFixErrorDetail(item) : formatImageErrorsForDisplay(imageErrors), displayArticleTitle(item)); });
     row.querySelector(".retry-api")?.addEventListener("click", async (event) => {
       event.stopPropagation();
@@ -987,7 +1062,11 @@ function renderSystemNotice() {
   const current = state.items?.find((item) => item.id === worker?.currentId);
   const latest = state.items?.find((item) => item.id === notice?.articleId);
   const waitingCount = (state.items || []).filter((item) => item.status === "chờ" && panelItemMatchesSource(item)).length;
-  const view = systemNoticeView({ active: currentTabIsRunning(), worker, current, notice, runner: state.runner, latest, waitingCount });
+  const failure = queueLoadFailure();
+  const view = failure && !current ? { phase: failure.storageError ? "Bộ nhớ tiện ích đã đầy" : "Không tải được hồ sơ", detail: `${failure.message}\n${failure.help || "Bấm Thử lại sau khi website sẵn sàng."}`, countdown: "", level: "error" }
+    : selectedSourceType() === "doctor" && state.doctorQueueState?.status === "loading" && !current
+      ? { phase: "Đang tải hồ sơ bác sĩ", detail: "Đang chờ API trả danh sách; chưa gửi prompt hoặc nhận khóa bài.", countdown: "", level: "info" }
+    : systemNoticeView({ active: currentTabIsRunning(), worker, current, notice, runner: state.runner, latest, waitingCount });
   $("systemPhase").textContent = view.phase;
   $("systemDetail").textContent = view.detail;
   $("systemCountdown").textContent = view.countdown;
@@ -1021,6 +1100,8 @@ function updateRunButton() {
   const activeSource = sourceInfo(activeSourceType);
   const canRunSelectedSource = canRunSourceOnProvider(activeSourceType, provider);
   const imageProviderUnavailable = !activeHere && !canRunSelectedSource;
+  const queueFailure = !activeHere ? queueLoadFailure() : null;
+  const queueLoading = !activeHere && activeSourceType === "doctor" && state.doctorQueueState?.status === "loading";
   const waiting = (state.items || []).filter((item) => item.status === "chờ" && panelItemMatchesSource(item)).length;
   const current = worker?.currentId
     ? (state.items || []).find((item) => item.id === worker.currentId)
@@ -1036,7 +1117,7 @@ function updateRunButton() {
   button.classList.toggle("is-unavailable", imageProviderUnavailable);
   button.setAttribute?.("aria-pressed", String(activeHere));
   button.setAttribute?.("aria-label", activeHere ? `Dừng ${label} trên tab này` : imageProviderUnavailable ? `Tạo ảnh AI chưa hỗ trợ trên ${label}` : `Chạy bằng ${label} trên tab này`);
-  button.disabled = loadingArticles || !panelContext.supported || imageProviderUnavailable;
+  button.disabled = loadingArticles || !panelContext.supported || imageProviderUnavailable || Boolean(queueFailure) || queueLoading;
   const capabilityHint = $("providerCapabilityHint");
   if (capabilityHint) {
     capabilityHint.hidden = !imageProviderUnavailable;
@@ -1046,6 +1127,13 @@ function updateRunButton() {
   if (!panelContext.supported) {
     $("runCaption").textContent = "Chưa nhận diện tab AI";
     $("runDetail").textContent = "Mở ChatGPT, Grok, Claude hoặc Gemini để chạy";
+  } else if (queueLoading) {
+    $("runCaption").textContent = "Đang tải hồ sơ";
+    $("runDetail").textContent = "Chờ API trả danh sách rồi bấm Chạy";
+  } else if (queueFailure) {
+    $("runCaption").textContent = queueFailure.storageError ? "Bộ nhớ tiện ích đã đầy" : "Không tải được hồ sơ";
+    $("runDetail").textContent = queueFailure.storageError ? "Reload tiện ích và tab AI · giữ nguyên JSON đã lưu" : queueFailure.schemaUnavailable ? "Website chưa sẵn sàng · quản trị kiểm tra schema, sau đó Thử lại" : "API bác sĩ gặp lỗi · kiểm tra cấu hình, sau đó Thử lại";
+    setStatus(queueFailure.message, true);
   } else if (imageProviderUnavailable) {
     $("runCaption").textContent = `Ảnh AI chưa hỗ trợ trên ${label}`;
     $("runDetail").textContent = "Dùng ChatGPT hoặc Grok để tạo ảnh";
@@ -1125,6 +1213,7 @@ $("clear").onclick = async () => {
   catch (error) { state.items = previous; render(); setStatus(error.message, true); }
 };
 $("refresh").onclick = loadArticles;
+$("queueRetry").onclick = loadArticles;
 $("sourceType").onchange = async () => {
   try {
     await saveTabSourcePreference();
@@ -1155,6 +1244,7 @@ async function toggleCurrentTabRun() {
   }
   const stopping = currentTabIsRunning();
   const sourceType = normalizeSourceType(stopping ? currentTabWorker()?.sourceType || selectedSourceType() : selectedSourceType());
+  if (!stopping && queueLoadFailure()) { setStatus(queueLoadFailure().message, true); updateRunButton(); return; }
   if (!stopping && !canRunSourceOnProvider(sourceType, provider)) {
     const message = imageProviderMessage(provider);
     setStatus(message, true);
@@ -1180,14 +1270,17 @@ async function toggleCurrentTabRun() {
     const request = { type: "start-run", targetTabId, provider, sourceType };
     if (sourceType === "translation") request.translationType = selectedTranslationType();
     const result = await chrome.runtime.sendMessage(request);
-    if (!result || result.ok !== true) throw new Error(result?.error || "Không nhận được phản hồi từ extension. Hãy Reload extension rồi tải lại tab AI.");
+    if (!result || result.ok !== true) {
+      if (sourceType === "doctor" && result?.doctorQueueError) state.doctorQueueState = result.queueState || doctorQueueFailure({ message: result.error, httpStatus: result.httpStatus });
+      throw new Error(result?.error || "Không nhận được phản hồi từ extension. Hãy Reload extension rồi tải lại tab AI.");
+    }
     const latest = await chrome.storage.local.get(["runner"]);
     if (latest.runner) state.runner = latest.runner;
-    if (!currentTabIsRunning()) updateLocalWorker(true);
+    if (!latest.runner && !currentTabIsRunning()) updateLocalWorker(true);
     updateRunButton();
-    setStatus(`Đang chạy ${providerName(provider)} trên tab này.`);
+    setStatus(currentTabIsRunning() ? `Đang chạy ${providerName(provider)} trên tab này.` : "Đã kiểm tra hàng đợi; hiện không có bài chạy trên tab này.");
   } catch (error) { setStatus(error.message, true); }
-  finally { updateRunButton(); }
+  finally { render(); }
 }
 $("runToggle").onclick = toggleCurrentTabRun;
 init();

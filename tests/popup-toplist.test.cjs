@@ -20,6 +20,30 @@ const defaults = {
   translationUrl: "https://medreview.vn/api/medical/translate-content.php"
 };
 
+const doctorSchemaMessage = "API danh sách bác sĩ HTTP 503: Chưa sẵn sàng schema bác sĩ. Chạy scripts/migrate_doctor_content.php.";
+const doctorQueueFailure = {
+  sourceType: "doctor", status: "error", httpStatus: 503, message: doctorSchemaMessage,
+  schemaUnavailable: true,
+  help: "Website chưa sẵn sàng schema bác sĩ. Chạy php scripts/migrate_doctor_content.php rồi thử lại."
+};
+const doctorQueueReady = { sourceType: "doctor", status: "ready", httpStatus: 200, message: "", schemaUnavailable: false, help: "" };
+
+function assertDoctorQueueFailure(popup) {
+  const queueState = popup.functions.getState().doctorQueueState;
+  assert.equal(queueState?.sourceType, "doctor");
+  assert.equal(queueState?.status, "error");
+  assert.equal(queueState?.httpStatus, 503);
+  assert.equal(queueState?.schemaUnavailable, true);
+  assert.equal(popup.node("queueLoadError").hidden, false);
+  assert.match(popup.node("queueErrorTitle").textContent, /bác sĩ|hồ sơ/i);
+  assert.match(popup.node("queueErrorMessage").textContent, /HTTP 503/);
+  assert.match(popup.node("queueErrorMessage").textContent, /Chưa sẵn sàng schema bác sĩ/);
+  assert.match(popup.node("queueErrorHelp").textContent, /php scripts\/migrate_doctor_content\.php/);
+  assert.equal(popup.node("runCaption").textContent, "Không tải được hồ sơ");
+  assert.match(popup.node("runDetail").textContent, /website|schema/i);
+  assert.equal(popup.node("runToggle").disabled, true);
+}
+
 function element() {
   const children = [];
   const listeners = new Map();
@@ -298,6 +322,343 @@ test("doctor source refresh and run are distinct from the translation doctor's s
   assert.equal(popup.node("resultsHeading").textContent, "Hồ sơ đã nghiên cứu");
 });
 
+test("doctor queue load failures have an accessible, initially hidden retry notice", () => {
+  const html = fs.readFileSync(path.join(__dirname, "../popup.html"), "utf8");
+  const notice = html.match(/<[^>]+\bid="queueLoadError"[^>]*>/)?.[0];
+  assert.ok(notice, "the queue load error needs a dedicated notice, not only the transient status line");
+  assert.match(notice, /\bhidden\b/);
+  assert.match(notice, /\brole="alert"|\baria-live="(?:assertive|polite)"/);
+  for (const id of ["queueErrorTitle", "queueErrorMessage", "queueErrorHelp"]) assert.match(html, new RegExp(`id="${id}"`));
+  const retry = html.match(/<button\b[^>]*\bid="queueRetry"[^>]*>/)?.[0];
+  assert.ok(retry, "retry must remain a keyboard-accessible native button");
+  assert.match(retry, /\btype="button"/);
+});
+
+test("doctor HTTP 503 blocks Run and preserves existing JSON and receipt leases", async () => {
+  const saved = { id: "tab-33:doctor-7", ownerTabId: 33, doctor_id: 7, sourceType: "doctor", title: "Bác sĩ đã lưu", status: "hoàn tất",
+    result: { id: 7, name: "Bác sĩ đã lưu", content: "JSON cũ vẫn giữ nguyên" }, api_update: { ok: true } };
+  const receipt = { id: "tab-33:doctor-8", ownerTabId: 33, doctor_id: 8, sourceType: "doctor", title: "Bác sĩ cần xác nhận", status: "chưa xác nhận",
+    result: { id: 8, content: "JSON đang chờ xác nhận" }, api_error: "POST chưa xác nhận",
+    writer_claim_token: "mock-owner-token", writer_claim_request_id: "mock-attempt-8", doctor_writer_request_id: "mock-attempt-8" };
+  const items = [saved, receipt];
+  const popup = loadPopup({ respond: async () => ({ ok: false, error: doctorSchemaMessage, httpStatus: 503,
+    doctorQueueError: true, queueState: doctorQueueFailure }) });
+  await popup.functions.resolvePanelContext();
+  popup.node("sourceType").value = "doctor";
+  popup.functions.setState({ sourceType: "doctor", items: plain(items), runner: { active: false } });
+  popup.functions.render();
+  const savedResultRow = popup.node("results").children[1]; // Results are newest first.
+  const receiptApiRow = popup.node("apiStatus").children[1];
+  assert.ok(savedResultRow);
+  assert.ok(receiptApiRow);
+
+  await popup.functions.loadArticles();
+
+  assertDoctorQueueFailure(popup);
+  assert.equal(popup.node("queueRetry").disabled, false, "a failed request must leave manual retry available");
+  assert.match(popup.node("status").textContent, /HTTP 503/);
+  assert.deepEqual(plain(popup.functions.getState().items), items, "loading an unavailable schema must not replace any stored JSON or lease");
+  assert.equal(popup.node("resultCount").textContent, "2");
+  assert.equal(popup.node("apiCount").textContent, "2");
+  assert.equal(popup.node("results").children[1], savedResultRow);
+  assert.equal(popup.node("apiStatus").children[1], receiptApiRow);
+  await popup.functions.toggleCurrentTabRun();
+  assert.equal(popup.messages.some((message) => message.type === "start-run"), false, "the defensive Run guard must also reject a direct call");
+});
+
+test("a thrown doctor HTTP 503 becomes a persistent queue error instead of a successful empty queue", async () => {
+  const popup = loadPopup({ respond: async () => { throw new Error(doctorSchemaMessage); } });
+  await popup.functions.resolvePanelContext();
+  popup.node("sourceType").value = "doctor";
+  popup.functions.setState({ sourceType: "doctor", items: [], runner: { active: false } });
+
+  await popup.functions.loadArticles();
+
+  assertDoctorQueueFailure(popup);
+  assert.equal(popup.node("queueCount").textContent, "0");
+  assert.doesNotMatch(popup.node("items").innerHTML, /Chưa có bài|Đã xử lý hết/, "an unavailable API must not be described as successfully exhausted");
+  assert.equal(popup.node("refresh").disabled, false);
+  assert.equal(popup.node("sourceType").disabled, false);
+  await popup.functions.toggleCurrentTabRun();
+  assert.equal(popup.messages.some((message) => message.type === "start-run"), false);
+});
+
+test("old raw quota error is restored as storage failure, not an API/schema outage", async () => {
+  const popup = loadPopup({ stored: {
+    ...defaults, sourceType: "doctor", "tab-task-source:33": { sourceType: "doctor" },
+    "tab-doctor-queue:33": { ...doctorQueueFailure, httpStatus: null, schemaUnavailable: false,
+      message: "Resource::kQuotaBytes quota exceeded", help: "Kiểm tra API/endpoint rồi thử lại." },
+    items: []
+  } });
+  await popup.init();
+  assert.equal(popup.node("queueLoadError").hidden, false);
+  assert.equal(popup.node("queueErrorTitle").textContent, "Bộ nhớ tiện ích đã đầy");
+  assert.match(popup.node("queueErrorHelp").textContent, /chrome:\/\/extensions/);
+  assert.match(popup.node("queueErrorHelp").textContent, /Không gỡ tiện ích/);
+  assert.doesNotMatch(popup.node("queueErrorHelp").textContent, /DB|schema|endpoint/);
+  assert.equal(popup.node("systemPhase").textContent, "Bộ nhớ tiện ích đã đầy");
+  assert.match(popup.node("runDetail").textContent, /Reload tiện ích/);
+  assert.equal(popup.messages.some((message) => message.type === "refresh-queue"), false);
+});
+
+for (const sourceType of ["doctor", "facility", "facility_image_fix", "toplist", "translation"]) {
+  test(`quota failure in ${sourceType} preserves saved JSON and offers safe retry`, async () => {
+    let ready = false;
+    const saved = { id: `tab-33:${sourceType}-7`, ownerTabId: 33, sourceType, title: "JSON đã lưu",
+      status: "lỗi cập nhật", has_result: true, content_version: 1, writer_claim_token: "original-token" };
+    const result = { id: 7, content: "Dữ liệu chưa gửi" };
+    const stored = { ...defaults, sourceType, "tab-task-source:33": { sourceType },
+      items: [saved], "tab-job-items:33": [saved], [`article-content:${saved.id}`]: { result, rawResponse: JSON.stringify(result) } };
+    const popup = loadPopup({ stored, respond: async () => ready ? { ok: true, items: [saved], added: 0,
+      queueState: doctorQueueReady } : { ok: false, error: "Resource::kQuotaBytes quota exceeded",
+      storageError: true, errorCode: "storage_quota_exceeded" } });
+    await popup.init();
+    await popup.functions.loadArticles();
+    assert.equal(popup.node("queueLoadError").hidden, false);
+    assert.equal(popup.node("queueErrorTitle").textContent, "Bộ nhớ tiện ích đã đầy");
+    assert.equal(popup.node("runToggle").disabled, true);
+    assert.equal(popup.functions.getState().items[0].writer_claim_token, saved.writer_claim_token);
+    assert.deepEqual(popup.stored[`article-content:${saved.id}`], stored[`article-content:${saved.id}`]);
+    const before = popup.messages.length;
+    await popup.functions.toggleCurrentTabRun();
+    assert.equal(popup.messages.slice(before).some((message) => message.type === "start-run"), false);
+    ready = true;
+    await popup.functions.loadArticles();
+    assert.equal(popup.node("queueLoadError").hidden, true);
+    assert.equal(popup.node("runToggle").disabled, false);
+    assert.deepEqual(popup.stored[`article-content:${saved.id}`], stored[`article-content:${saved.id}`]);
+  });
+}
+
+test("a stored doctor schema failure is restored for its tab without automatically requesting it again", async () => {
+  const otherTabState = { ...doctorQueueReady, message: "Tab khác đã tải được" };
+  const popup = loadPopup({ stored: {
+    "tab-task-source:33": { sourceType: "doctor" }, "tab-job-items:33": [],
+    "tab-doctor-queue:33": doctorQueueFailure, "tab-doctor-queue:44": otherTabState,
+    runner: { active: false }
+  } });
+
+  await popup.init();
+
+  assert.equal(popup.node("sourceType").value, "doctor");
+  assertDoctorQueueFailure(popup);
+  assert.deepEqual(plain(popup.functions.getState().doctorQueueState), doctorQueueFailure);
+  assert.equal(popup.messages.some((message) => message.type === "refresh-queue"), false, "reopening the panel must wait for an explicit retry after 503");
+  for (const timer of popup.intervals.filter((timer) => !timer.cleared)) timer.callback();
+  assert.equal(popup.messages.some((message) => message.type === "refresh-queue"), false, "UI clocks must not become an automatic retry loop");
+  assert.deepEqual(popup.stored["tab-doctor-queue:44"], otherTabState);
+});
+
+test("the legacy doctor queue namespace restores a failure when no target tab is available", async () => {
+  const popup = loadPopup({ tabContext: { ok: false, error: "Không xác định được tab AI." }, stored: {
+    sourceType: "doctor", items: [], "tab-doctor-queue:legacy": doctorQueueFailure, runner: { active: false }
+  } });
+
+  await popup.init();
+
+  assert.equal(popup.functions.getPanelContext().targetTabId, null);
+  assert.deepEqual(plain(popup.functions.getState().doctorQueueState), doctorQueueFailure);
+  assert.equal(popup.node("queueLoadError").hidden, false);
+  assert.match(popup.node("queueErrorMessage").textContent, /HTTP 503/);
+  assert.equal(popup.messages.some((message) => message.type === "refresh-queue"), false);
+});
+
+test("manual doctor retry clears the schema error and keeps old JSON and unresolved receipt leases", async () => {
+  const saved = { id: "tab-33:doctor-7", ownerTabId: 33, doctor_id: 7, sourceType: "doctor", title: "Bác sĩ đã lưu", status: "hoàn tất",
+    result: { id: 7, content: "Giữ JSON đã lưu" }, api_update: { ok: true } };
+  const receipt = { id: "tab-33:doctor-8", ownerTabId: 33, doctor_id: 8, sourceType: "doctor", title: "Bác sĩ chưa xác nhận", status: "chưa xác nhận",
+    result: { id: 8, content: "Giữ JSON chờ API" }, writer_claim_token: "mock-owner-token",
+    writer_claim_request_id: "mock-attempt-8", doctor_writer_request_id: "mock-attempt-8", api_error: "POST chưa xác nhận" };
+  const next = { id: "tab-33:doctor-9", ownerTabId: 33, doctor_id: 9, sourceType: "doctor", title: "Bác sĩ mới", status: "chờ", prompt: "Prompt API nguyên bản" };
+  const popup = loadPopup({ stored: {
+    "tab-task-source:33": { sourceType: "doctor" }, "tab-job-items:33": [saved, receipt],
+    "tab-doctor-queue:33": doctorQueueFailure, runner: { active: false }
+  }, respond: async (message) => message.type === "refresh-queue"
+    ? { ok: true, items: [saved, receipt, next], added: 1, skipped: 0, queueState: doctorQueueReady }
+    : { ok: true } });
+  await popup.init();
+  assertDoctorQueueFailure(popup);
+  const savedResultRow = popup.node("results").children[1]; // Results are newest first.
+  const receiptApiRow = popup.node("apiStatus").children[1];
+  assert.ok(savedResultRow);
+  assert.ok(receiptApiRow);
+
+  await popup.node("queueRetry").click();
+
+  assert.deepEqual(popup.messages.filter((message) => message.type === "refresh-queue"), [
+    { type: "refresh-queue", sourceType: "doctor", targetTabId: 33 }
+  ]);
+  assert.equal(popup.functions.getState().doctorQueueState?.status, "ready");
+  assert.equal(popup.node("queueLoadError").hidden, true);
+  assert.equal(popup.node("runToggle").disabled, false);
+  assert.notEqual(popup.node("runCaption").textContent, "Không tải được hồ sơ");
+  assert.deepEqual(plain(popup.functions.getState().items), [saved, receipt, next]);
+  assert.equal(popup.node("results").children[1], savedResultRow, "successful retry keeps the saved JSON history row");
+  assert.equal(popup.node("apiStatus").children[1], receiptApiRow, "successful retry does not rebuild an unresolved receipt row");
+  await savedResultRow.click();
+  assert.deepEqual(JSON.parse(popup.node("modalJson").textContent), saved.result);
+  await popup.functions.toggleCurrentTabRun();
+  assert.deepEqual(popup.messages.at(-1), { type: "start-run", targetTabId: 33, provider: "chatgpt", sourceType: "doctor" });
+});
+
+test("a successful HTTP 200 doctor retry with no rows is ready, not a schema failure", async () => {
+  const popup = loadPopup({ stored: {
+    "tab-task-source:33": { sourceType: "doctor" }, "tab-job-items:33": [],
+    "tab-doctor-queue:33": doctorQueueFailure, runner: { active: false }
+  }, respond: async (message) => message.type === "refresh-queue"
+    ? { ok: true, items: [], added: 0, skipped: 0, queueState: doctorQueueReady }
+    : { ok: true } });
+  await popup.init();
+
+  await popup.node("queueRetry").click();
+
+  assert.equal(popup.functions.getState().doctorQueueState?.status, "ready");
+  assert.equal(popup.node("queueLoadError").hidden, true);
+  assert.equal(popup.node("queueCount").textContent, "0");
+  assert.equal(popup.node("runToggle").disabled, false);
+  assert.equal(popup.node("runCaption").textContent, "Sẵn sàng");
+  assert.match(popup.node("runDetail").textContent, /Không còn bác sĩ đang chờ/);
+  assert.doesNotMatch(popup.node("status").textContent, /HTTP 503|schema bác sĩ/);
+});
+
+test("a doctor queue failure does not block a facility source on the same tab", async () => {
+  const facility = { id: "tab-33:facility-7", ownerTabId: 33, facility_id: 7, sourceType: "facility", title: "Cơ sở", prompt: "Prompt cơ sở", status: "chờ" };
+  const popup = loadPopup({ respond: async () => ({ ok: true }) });
+  await popup.functions.resolvePanelContext();
+  popup.functions.setState({ sourceType: "doctor", doctorQueueState: doctorQueueFailure, items: [facility], runner: { active: false } });
+  popup.node("sourceType").value = "doctor";
+  popup.functions.render();
+  assertDoctorQueueFailure(popup);
+
+  popup.node("sourceType").value = "facility";
+  popup.functions.render();
+
+  assert.equal(popup.node("queueLoadError").hidden, true);
+  assert.equal(popup.node("runToggle").disabled, false);
+  assert.equal(popup.node("queueCount").textContent, "1");
+  assert.deepEqual(plain(popup.functions.getState().doctorQueueState), doctorQueueFailure, "switching sources preserves the doctor diagnostic for later");
+  await popup.functions.toggleCurrentTabRun();
+  assert.deepEqual(popup.messages.at(-1), { type: "start-run", targetTabId: 33, provider: "chatgpt", sourceType: "facility" });
+});
+
+test("doctor queue storage changes repaint only the matching tab and clear a recovered error", async () => {
+  const waiting = { id: "tab-33:doctor-7", ownerTabId: 33, doctor_id: 7, sourceType: "doctor", title: "Bác sĩ", prompt: "Nghiên cứu", status: "chờ" };
+  const popup = loadPopup({ stored: {
+    "tab-task-source:33": { sourceType: "doctor" }, "tab-job-items:33": [waiting],
+    "tab-doctor-queue:33": doctorQueueReady, runner: { active: false }
+  } });
+  await popup.init();
+  const queueRow = popup.node("items").children[0];
+  assert.equal(popup.node("queueLoadError").hidden, true);
+
+  popup.emitChanges({ "tab-doctor-queue:44": { newValue: doctorQueueFailure } });
+
+  assert.equal(popup.functions.getState().doctorQueueState?.status, "ready");
+  assert.equal(popup.node("queueLoadError").hidden, true);
+  assert.equal(popup.node("runToggle").disabled, false);
+  assert.equal(popup.node("items").children[0], queueRow);
+
+  popup.emitChanges({ "tab-doctor-queue:33": { newValue: doctorQueueFailure } });
+
+  assertDoctorQueueFailure(popup);
+  assert.equal(popup.node("items").children[0], queueRow, "error metadata must not recreate queued jobs or lose their actions");
+
+  popup.emitChanges({ "tab-doctor-queue:33": { newValue: doctorQueueReady } });
+
+  assert.equal(popup.node("queueLoadError").hidden, true);
+  assert.equal(popup.node("runToggle").disabled, false);
+  assert.equal(popup.functions.getState().doctorQueueState?.status, "ready");
+  assert.equal(popup.node("items").children[0], queueRow);
+  assert.equal(popup.messages.some((message) => message.type === "refresh-queue"), false, "storage repaint is not an implicit reload");
+});
+
+test("another panel's pending doctor refresh keeps Run disabled until its queue is ready", async () => {
+  const popup = loadPopup({ stored: {
+    "tab-task-source:33": { sourceType: "doctor" }, "tab-job-items:33": [],
+    "tab-doctor-queue:33": doctorQueueFailure, runner: { active: false }
+  } });
+  await popup.init();
+
+  popup.emitChanges({ "tab-doctor-queue:33": { newValue: { sourceType: "doctor", status: "loading", requestId: "other-panel-refresh" } } });
+
+  assert.equal(popup.functions.getState().doctorQueueState.status, "loading");
+  assert.equal(popup.node("runToggle").disabled, true, "removing the previous error must not make an unconfirmed queue runnable");
+  assert.match(popup.node("runCaption").textContent, /^Đang tải hồ sơ(?: bác sĩ)?$/);
+  assert.equal(popup.messages.some((message) => message.type === "refresh-queue" || message.type === "start-run"), false);
+
+  popup.emitChanges({ "tab-doctor-queue:33": { newValue: doctorQueueReady } });
+
+  assert.equal(popup.node("runToggle").disabled, false);
+  assert.equal(popup.node("runCaption").textContent, "Sẵn sàng");
+  assert.equal(popup.node("queueLoadError").hidden, true);
+});
+
+test("manual doctor retry immediately shows pending feedback and cannot send duplicate refreshes", async () => {
+  let resolveReply, enteredRefresh;
+  const entered = new Promise((resolve) => { enteredRefresh = resolve; });
+  const popup = loadPopup({ stored: {
+    "tab-task-source:33": { sourceType: "doctor" }, "tab-job-items:33": [],
+    "tab-doctor-queue:33": doctorQueueFailure, runner: { active: false }
+  }, respond: async (message) => {
+    if (message.type !== "refresh-queue") return { ok: true };
+    enteredRefresh();
+    return new Promise((resolve) => { resolveReply = resolve; });
+  } });
+  await popup.init();
+
+  const retrying = popup.node("queueRetry").click();
+  await entered;
+
+  assert.equal(popup.node("queueRetry").disabled, true);
+  assert.equal(popup.node("queueRetry").textContent, "Đang thử lại…");
+  assert.equal(popup.node("runToggle").disabled, true);
+  await popup.node("queueRetry").click(); // A direct event still exercises the loading guard.
+  assert.equal(popup.messages.filter((message) => message.type === "refresh-queue").length, 1);
+  resolveReply({ ok: true, items: [], added: 0, skipped: 0, queueState: doctorQueueReady });
+  await retrying;
+  assert.equal(popup.node("queueLoadError").hidden, true);
+  assert.equal(popup.node("runToggle").disabled, false);
+});
+
+test("a doctor URL error popup gives field-specific manual repair instructions without sending AI or losing JSON", async () => {
+  const result = { id: 12, name: "BS. Nguyễn Văn An", website_url: { url: "https://example.org/doctor" },
+    sources_json: [{ id: "s1", url: "https://example.org/doctor" }],
+    evidence_json: { identity_status: "matched" }, future_field: { original: [null, false] } };
+  const item = { id: "tab-33:doctor-12", ownerTabId: 33, doctor_id: 12, name: result.name, title: result.name,
+    sourceType: "doctor", status: "lỗi cập nhật", result,
+    api_error: "website_url: URL phải là chuỗi hoặc null, không phải object, mảng, số hay boolean. JSON gốc được giữ nguyên, chưa gửi website." };
+  const popup = loadPopup();
+  await popup.functions.resolvePanelContext();
+  popup.node("sourceType").value = "doctor";
+  popup.functions.setState({ sourceType: "doctor", items: [plain(item)], runner: { active: false } });
+  popup.functions.render();
+  const messagesBefore = popup.messages.length;
+
+  await popup.node("apiStatus").children[0].querySelector(".api-state").click();
+
+  assert.equal(popup.node("jsonModal").hidden, false);
+  const guide = popup.node("modalJson").textContent;
+  assert.match(guide, /website_url: URL/);
+  assert.match(guide, /Hướng dẫn sửa JSON bằng AI \(chưa tự gửi\)/);
+  assert.match(guide, /id 12/);
+  assert.ok(guide.includes(JSON.stringify(result.name)));
+  assert.match(guide, /Giữ nguyên id, name/);
+  assert.match(guide, /không (?:tự chọn URL từ object nhiều trường hay )?xoá ảnh\/nguồn\/chứng cứ/);
+  assert.match(guide, /gallery_json\[i\]\.url.*sources_json\[i\]\.url/);
+  assert.match(guide, /bắt buộc.*không null/);
+  assert.match(guide, /social_links_json.*CHUỖI URL/);
+  assert.match(guide, /social_links_json.*object.*danh sách object chỉ gồm platform và url/);
+  assert.match(guide, /giữ tên nền tảng.*khoảng trắng ngoài.*không trùng\/trống/);
+  assert.match(guide, /không tự chọn URL từ object nhiều trường/);
+  assert.match(guide, /video_urls_json.*CHUỖI URL/);
+  assert.match(guide, /không thêm claim token\/khóa API/);
+  assert.match(guide, /gửi lại JSON cũ sẽ vẫn bị chặn nếu chưa sửa/);
+  assert.equal(popup.messages.length, messagesBefore, "reading repair guidance must not automatically send a prompt or resubmit JSON");
+  assert.deepEqual(plain(popup.functions.getState().items[0]), item);
+  await popup.node("results").children[0].click();
+  assert.deepEqual(JSON.parse(popup.node("modalJson").textContent), result, "the original malformed JSON stays available separately from the repair guidance");
+});
+
 test("completed doctor insufficient-data research is a completed audit, not a retryable failed article", () => {
   const popup = loadPopup();
   const doctor = { id: "doctor-7", doctor_id: 7, sourceType: "doctor", title: "Bác sĩ A", status: "hoàn tất",
@@ -405,7 +766,15 @@ test("one button auto-detects Claude and controls only its exact tab", async () 
         workers: { "tab-44": { active: true, provider: "grok", targetTabId: 44, currentId: "facility-8" } }
       }
     },
-    respond: async () => ({ ok: true })
+    respond: async (message) => {
+      if (message.type === "start-run") popup.emitChanges({ runner: { newValue: {
+        active: true, workers: {
+          "tab-44": { active: true, provider: "grok", targetTabId: 44, currentId: "facility-8" },
+          "tab-33": { active: true, provider: "claude", targetTabId: 33, sourceType: "facility" }
+        }
+      } } });
+      return { ok: true };
+    }
   });
   await popup.functions.resolvePanelContext();
   popup.functions.setState({

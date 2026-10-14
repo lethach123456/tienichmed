@@ -1,6 +1,6 @@
 # MedReview AI content
 
-Chrome Extension (Manifest V3), phiên bản 1.6.4, để quản lý hàng đợi bài viết, hồ sơ bác sĩ, Toplist, dịch Việt → Anh, tạo ảnh AI và kiểm tra/sửa ảnh thật của cơ sở; tiện ích nhập prompt vào ChatGPT/Grok/Claude/Gemini đang mở, đọc JSON phản hồi và lưu lại trong tiện ích.
+Chrome Extension (Manifest V3), phiên bản 1.6.6, để quản lý hàng đợi bài viết, hồ sơ bác sĩ, Toplist, dịch Việt → Anh, tạo ảnh AI và kiểm tra/sửa ảnh thật của cơ sở; tiện ích nhập prompt vào ChatGPT/Grok/Claude/Gemini đang mở, đọc JSON phản hồi và lưu lại trong tiện ích.
 
 Panel làm việc xuất hiện ở mép phải trên `chatgpt.com`, `grok.com`, `claude.ai` và `gemini.google.com`. Panel tự nhận diện AI theo URL và có một nút **Chạy/Dừng**: bấm trong tab nào thì chỉ tab đó nhận bài. Có thể chạy nhiều tab của cùng một AI hoặc các AI khác nhau song song; mỗi bài được khóa theo tab nên không bị nhận trùng.
 
@@ -9,6 +9,14 @@ Mỗi tab có bộ nhớ riêng: nguồn tác vụ/loại dịch, danh sách ch�
 Hàng đợi tự kiểm tra khôi phục mỗi phút và khi tiến trình nền khởi động lại. Nếu tab đang chạy bị mất lượt chuyển bài hoặc còn giữ ID của bài đã xong, tiện ích tiếp tục bài chờ của đúng tab, không chạy lại bài đang viết/gửi và không khởi động tab đã bấm Dừng. Thời gian nghỉ 60 giây được lưu bền vững; panel hiển thị số bài chờ hoặc lý do bị khóa thay vì báo đợi chung chung. API **lấy danh sách** có giới hạn 60 giây để không giữ hàng đợi mãi khi mất mạng; API **gửi kết quả** vẫn không có thời gian cắt tự động.
 
 ## Cài đặt
+
+### Cập nhật khi gặp `Resource::kQuotaBytes quota exceeded`
+
+Đây là lỗi vượt hạn mức lưu trữ của Chrome, không phải lỗi API bác sĩ. Bản 1.6.6 thêm quyền `unlimitedStorage` cho dữ liệu cục bộ chứa prompt, JSON và biên nhận gửi lại; không đổi API hoặc khóa bài, không xóa/cắt JSON để né lỗi. Lịch sử vẫn giữ hai bài thành công cho từng tab/nguồn; bài lỗi, chưa gửi và chưa xác nhận vẫn được giữ nguyên.
+
+Sau khi cập nhật mã trong **đúng thư mục đang Load unpacked**, vào `chrome://extensions`, bấm **Tải lại / Reload** tiện ích (cho phép quyền mới nếu Chrome yêu cầu). Tải lại tab AI rồi bấm **Thử lại**. Không gỡ rồi cài lại tiện ích hoặc xóa dữ liệu lưu trữ, vì làm vậy có thể mất JSON đang chờ. Chỉ reload tab AI mà chưa reload tiện ích thì quyền mới chưa được áp dụng.
+
+Thông báo đầy bộ nhớ được phân biệt với HTTP 401/403/503 và không hướng dẫn sửa DB/schema khi lỗi xuất phát từ lưu trữ. Nếu ghi dữ liệu thất bại, tiện ích không xóa nội dung cũ trước khi lưu được hàng đợi mới và không gửi kết quả lên website khi chưa lưu được bản gửi lại.
 
 1. Mở `chrome://extensions`, bật **Developer mode**.
 2. Chọn **Load unpacked** và chọn thư mục tiện ích này.
@@ -31,15 +39,23 @@ Trong **Cài đặt** (⚙), có URL riêng cho **Cơ sở y tế**, **Viết h�
 - Nhận ảnh AI: `https://medreview.vn/api/medical/facility-ai-image-update.php`
 - Lấy prompt/lưu bản dịch: `https://medreview.vn/api/medical/translate-content.php`
 
-Các API dùng header `X-Medical-Api-Key: them`. Chọn **Toplist** tại **Nguồn lấy bài** để tải danh sách. Các nguồn thông thường lấy một bài mỗi lần; nguồn bác sĩ lấy lô tối đa 25 bản ghi theo cấu hình để bỏ qua bác sĩ đang được phiên khác giữ khóa, nhưng mỗi tab vẫn chỉ viết một bác sĩ tại một thời điểm. Sau khi bài được lưu thành công, tab nghỉ 60 giây rồi xử lý bài tiếp theo. Bài lỗi không làm extension tải tiếp lô mới. Extension dùng nguyên `prompt` từ API. Các bài đã tải từ trước vẫn nằm trong hàng đợi, và mỗi bài giữ loại riêng để tự gửi về đúng API kể cả khi bấm **Gửi lại** hoặc đổi nguồn tải bài. URL đã lưu trước đây trên `top.top` hoặc `xxhihi.site` sẽ tự chuyển sang `medreview.vn` khi extension khởi động.
+Các API dùng header `X-Medical-Api-Key` lấy từ file cấu hình riêng `api-key.local.js` của bản cài (file này bị Git bỏ qua; không đưa khóa vào prompt hoặc mã phát hành). Worker dùng chế độ classic để nạp cấu hình này bằng `importScripts`. Chọn **Toplist** tại **Nguồn lấy bài** để tải danh sách. Các nguồn thông thường lấy một bài mỗi lần; nguồn bác sĩ lấy lô tối đa 25 bản ghi theo cấu hình để bỏ qua bác sĩ đang được phiên khác giữ khóa, nhưng mỗi tab vẫn chỉ viết một bác sĩ tại một thời điểm. Sau khi bài được lưu thành công, tab nghỉ 60 giây rồi xử lý bài tiếp theo. Bài lỗi không làm extension tải tiếp lô mới. Extension dùng nguyên `prompt` từ API. Các bài đã tải từ trước vẫn nằm trong hàng đợi, và mỗi bài giữ loại riêng để tự gửi về đúng API kể cả khi bấm **Gửi lại** hoặc đổi nguồn tải bài. URL đã lưu trước đây trên `top.top` hoặc `xxhihi.site` sẽ tự chuyển sang `medreview.vn` khi extension khởi động.
 
 ## Viết hồ sơ bác sĩ
+
+Lỗi tải danh sách khác với HTTP 200 `items=[]`: HTTP 503/schema chưa sẵn sàng hiển thị đầy đủ lỗi, trạng thái **Không tải được hồ sơ**, hướng dẫn quản trị và nút **Thử lại**. Nút Chạy bị chặn riêng nguồn bác sĩ của tab đó; không tự retry dồn dập khi mở lại panel, không chuyển sang cơ sở/nguồn khác. JSON, prompt, token/biên nhận và kết quả cũ vẫn được giữ. Khi API sẵn sàng, bấm Thử lại để tải lại danh sách rồi Chạy; hồ sơ đã lưu không tự viết đè.
+
+503 có thể do DB/schema/bản deploy; tiện ích không khẳng định thiếu migration là nguyên nhân duy nhất. Quản trị cần kiểm tra log và, sau deploy, chạy CLI `php scripts/migrate_doctor_content.php` trên đúng DB server để cập nhật schema/prompt. Không chạy migration qua HTTP hay từ tiện ích. Prompt/output_template mới của server được dùng nguyên vẹn, gồm 11 trường Hồ sơ & pháp lý và `practice_license_json` cũ; không suy đoán dữ liệu thiếu hay tự verified. Lỗi 401/403/503 ở heartbeat hoặc API nhận (kể cả phản hồi không phải JSON) cũng dừng riêng luồng bác sĩ, giữ kết quả và mã yêu cầu để kiểm tra lại.
 
 Chọn **Viết hồ sơ bác sĩ**, bấm **Tải lại** rồi **Chạy** trên tab AI. Đây là nguồn nghiên cứu tiếng Việt riêng, không phải **Dịch Việt → Anh → Bác sĩ**. Trước mỗi lượt, tiện ích kiểm tra lại điều kiện từ API và lấy prompt/output_template mới, không dùng prompt chung hoặc bản cache cũ. Bác sĩ phải là bản tiếng Việt đã xuất bản, chưa có nội dung và chưa được nghiên cứu.
 
 Tiện ích xin khóa `type=doctor` trước khi gửi AI, giữ nguyên `request_id` và danh tính worker khi thử lại, gia hạn khóa mỗi 45 giây trong lúc viết hoặc gửi. Bác sĩ đã có nội dung, chưa xuất bản hoặc đang được phiên khác khóa sẽ không nhận prompt trùng. Token và API key không được đưa vào prompt.
 
 AI phải trả đúng một JSON object trong một code block, `id` là số nguyên dương đúng ID bác sĩ, `name` giữ nguyên chính xác. Tiện ích kiểm tra đầy đủ các khóa `output_template`, giữ arrays/objects/null/trường mới, không cho AI sửa slug, trạng thái, điểm đánh giá, xác minh hoặc các trường vận hành. Chỉ POST tới API bác sĩ dưới dạng `{items:[{...JSON_AI,writer_claim_token:token}]}`, không gửi nhầm sang API cơ sở. Hồ sơ lưu với trạng thái chưa duyệt. `insufficient_data=true` kèm ghi chú biên tập là một nghiên cứu hoàn tất, không phải lỗi để tự viết lại.
+
+Trước POST, URL gốc và các khóa `url`/`website_url`/`booking_url` trong các trường JSON của hợp đồng bác sĩ được kiểm tra đúng kiểu HTTP(S), giới hạn độ dài và không chứa thông tin đăng nhập. URL tùy chọn cho phép null; URL trong gallery, sources, social và video phải là chuỗi không rỗng. Object/mảng/số/boolean/Markdown sai kiểu sẽ bị chặn với đường dẫn cụ thể như `gallery_json[0].url`, không tự chuyển kiểu hay chọn một URL thay thế. JSON và phản hồi gốc vẫn được lưu; bấm biểu tượng lỗi để xem hướng dẫn sửa bằng AI. Hướng dẫn không tự gửi prompt khi AI đang viết, không thêm token/khóa API; gửi lại JSON chưa sửa vẫn bị chặn.
+
+Riêng `social_links_json`, API hỗ trợ thêm danh sách `[{platform:"Tên nền tảng",url:"https://..."}]`. Tiện ích chuyển đúng dạng này thành object nền tảng:URL **chỉ ở payload gửi**, không sửa JSON/ phản hồi AI gốc đã lưu. Tên nền tảng chỉ bỏ khoảng trắng ngoài, không suy đoán nhãn như facebook/website. Tên trống/trùng, URL sai, object có trường bổ sung hoặc nhiều URL không rõ ràng đều bị chặn, không ghi đè hay bỏ chứng cứ. Object canonical và các trường khác được giữ nguyên; Gửi lại cũng dùng cùng bước kiểm tra/chuyển đổi này.
 
 Nếu mất phản hồi POST, JSON và mã yêu cầu được lưu bền vững. Tiện ích kiểm tra `doctor-content.php?id=...` khi khởi động, mỗi phút và trước khi gửi lại; chỉ xác nhận thành công khi `last_researched_at` có giá trị và `full_json.writer_request_id` trùng lượt của mình. Trong khi chưa xác nhận, không chuyển sang bác sĩ khác. Biên nhận của phiên khác không được tính là thành công. JSON được giữ nếu mất khóa, nhưng không gửi dữ liệu cũ dưới một khóa khác. HTTP 401/403/503 dừng riêng worker bác sĩ và hiển thị lỗi để sửa cấu hình/backend.
 

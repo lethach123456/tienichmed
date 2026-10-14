@@ -20,6 +20,7 @@ function loadBackground(initial, harnessOptions = {}) {
   const tabUpdates = [];
   const reloadedTabs = [];
   const fetchCalls = [];
+  const claimCalls = [];
   let removedListener;
   let messageListener;
   let alarmListener;
@@ -44,6 +45,7 @@ function loadBackground(initial, harnessOptions = {}) {
     tabs: {
       onRemoved: { addListener(listener) { removedListener = listener; } },
       async get(tabId) {
+        if (harnessOptions.tabGet) return harnessOptions.tabGet(tabId, tabs);
         const tab = tabs.get(Number(tabId));
         if (!tab) throw new Error("No tab");
         return plain(tab);
@@ -75,6 +77,11 @@ function loadBackground(initial, harnessOptions = {}) {
   const fetch = async (url, options = {}) => {
     const body = options.body ? JSON.parse(options.body) : {};
     if (String(url).includes("writer-claim.php")) {
+      claimCalls.push(plain(body));
+      if (harnessOptions.claimResponse) {
+        const fixture = await harnessOptions.claimResponse(body, state);
+        if (fixture) return { ok: fixture.status < 400, status: fixture.status, async text() { return JSON.stringify(fixture.body); } };
+      }
       const result = body.action === "claim"
         ? { ok: true, claimed: true, claim_token: `test-claim-${body.id}`, lease_seconds: 180 }
         : { ok: true, lease_seconds: 180, released: body.action === "release" };
@@ -100,7 +107,8 @@ function loadBackground(initial, harnessOptions = {}) {
       recordArticleProgress, markGeminiSparkStallReload, recordArticleRetryCountdown,
       scheduleSparkJobRetry, dispatchSparkJobRetry, continueAfterReload, recordArticlePromptSent,
       prepareNextArticle, recordArticlePromptPrepared, resumeNextJobDeadline, restoreNextJobAlarms, recordSystemNotice, pruneCompletedHistory, retryUpdate, clearCurrent, jobStorage, getJobMetadata, hydrateArticle, getArticleContent,
-      refreshQueue, refillWorkerQueue, mergeQueueItems, runNext, getTabSettings, recoverIdleWorkers, waitBeforeNextJob, fetchTranslations
+      refreshQueue, refillWorkerQueue, mergeQueueItems, runNext, getTabSettings, recoverIdleWorkers, waitBeforeNextJob, fetchTranslations,
+      cleanupClosedTabJobs, reconcileClosedTabJobs, hasOtherTabJobInFlight, renewActiveWriterClaims, initializeExtensionStorage, activeApiRequests
     };
   `;
   const retryTimers = [];
@@ -112,11 +120,174 @@ function loadBackground(initial, harnessOptions = {}) {
   const context = vm.createContext({
     MEDREVIEW_MEDICAL_API_KEY: "test-medical-key", chrome, fetch, URL, structuredClone, AbortController, setTimeout: testSetTimeout, clearTimeout: harnessOptions.clearTimeout || clearTimeout });
   vm.runInContext(source, context, { filename: "background.js" });
-  return { ...context.__multiTabTests, state, sent, tabUpdates, reloadedTabs, fetchCalls, tabs,
+  return { ...context.__multiTabTests, state, sent, tabUpdates, reloadedTabs, fetchCalls, claimCalls, tabs,
     getRemovedListener: () => removedListener, getAlarmListener: () => alarmListener, createdAlarms, retryTimers, storageReads, storageWrites,
     dispatch(message, sender = {}) { return new Promise((resolve) => messageListener(message, sender, resolve)); }
   };
 }
+
+test("closed workerless history no longer blocks another tab and preserves JSON/storage", async () => {
+  for (const status of ["hoàn tất", "lỗi cập nhật", "ảnh chưa đủ"]) {
+    const old = { id: "tab-202:facility-71", ownerTabId: 202, facility_id: 71, sourceType: "facility", status,
+      content_version: 1, has_result: true };
+    const content = { prompt: "Original prompt", rawResponse: "Original raw JSON", result: { id: 71, content: "Keep me" } };
+    const api = loadBackground({ items: [old], runner: { active: false, workers: {} },
+      ["article-content:" + old.id]: content });
+    const candidate = { id: "tab-101:facility-71", ownerTabId: 101, facility_id: 71, sourceType: "facility" };
+    assert.equal(api.hasOtherTabJobInFlight(api.state.items, candidate, 101), true);
+    api.tabs.delete(202);
+    await api.getRemovedListener()(202);
+    assert.equal(api.hasOtherTabJobInFlight(api.state.items, candidate, 101), false);
+    assert.equal(api.state.items[0].status, status);
+    assert.deepEqual(api.state["article-content:" + old.id], content);
+    assert.equal(api.claimCalls.length, 0);
+    assert.equal(api.sent.length, 0);
+  }
+});
+
+test("startup and heartbeat recover missed tab-close events and release instead of renewing orphan claims", async () => {
+  for (const entryPoint of ["initializeExtensionStorage", "renewActiveWriterClaims", "recoverIdleWorkers"]) {
+    const api = loadBackground({ items: [{ id: "tab-202:facility-71", ownerTabId: 202, facility_id: 71,
+      sourceType: "facility", status: "đang viết", writer_claim_token: "owned-old-token", writer_claim_required: true }],
+      runner: { active: true, workers: { "tab-202": { active: true, targetTabId: 202, provider: "grok", currentId: "tab-202:facility-71" } } } });
+    api.tabs.delete(202);
+    await api[entryPoint]();
+    assert.equal(api.state.items[0].status, "chờ", entryPoint);
+    assert.equal(api.state.items[0].writer_claim_token, undefined);
+    assert.equal(api.state.runner.workers["tab-202"], undefined);
+    assert.deepEqual(api.claimCalls.map(({ action, claim_token }) => ({ action, claim_token })), [{ action: "release", claim_token: "owned-old-token" }]);
+    assert.equal(api.sent.length, 0);
+  }
+});
+
+test("closed legacy current worker is positively associated but unrelated unowned jobs are untouched", async () => {
+  const api = loadBackground({ items: [{ id: "facility-71", facility_id: 71, status: "đang viết", writer_claim_token: "legacy-token" },
+    { id: "facility-72", facility_id: 72, status: "đang viết", writer_claim_token: "unowned-token" }],
+    runner: { active: true, targetTabId: 202, provider: "grok", currentId: "facility-71" } });
+  api.tabs.delete(202);
+  await api.reconcileClosedTabJobs();
+  assert.equal(api.state.items[0].ownerTabId, 202);
+  assert.equal(api.state.items[0].writer_claim_token, undefined);
+  assert.equal(api.state.items[1].ownerTabId, undefined);
+  assert.equal(api.state.items[1].writer_claim_token, "unowned-token");
+  assert.equal(api.state.runner.active, false);
+});
+
+test("Run after a missed close releases the old tab token before claiming and dispatching once in the new tab", async () => {
+  const api = loadBackground({ sourceType: "facility", items: [
+    { id: "tab-202:facility-71", ownerTabId: 202, facility_id: 71, sourceType: "facility", status: "lỗi cập nhật",
+      writer_claim_token: "closed-owner-token", result: { id: 71, content: "Original preserved JSON" } },
+    { id: "tab-101:facility-71", ownerTabId: 101, facility_id: 71, sourceType: "facility", status: "chờ", prompt: "Fresh prompt", writer_claim_required: true }
+  ], runner: { active: false, workers: {} } });
+  api.tabs.delete(202);
+  await api.startRun({ provider: "grok", targetTabId: 101 }, sender(101, api.tabs.get(101).url));
+  assert.deepEqual(api.claimCalls.map(({ action }) => action), ["release", "claim"]);
+  assert.equal(api.claimCalls[0].claim_token, "closed-owner-token");
+  const prompts = api.sent.filter(({ message }) => message.type === "run-article");
+  assert.equal(prompts.length, 1);
+  assert.equal(prompts[0].tabId, 101);
+  assert.equal(prompts[0].message.prompt, "Fresh prompt");
+  assert.deepEqual(api.state["article-content:tab-202:facility-71"].result, { id: 71, content: "Original preserved JSON" });
+});
+
+test("live/stopped peer and unknown tabs API errors are not treated as closed", async () => {
+  for (const tabGet of [undefined, async () => { throw new Error("Permission denied"); }]) {
+    const api = loadBackground({ items: [{ id: "tab-202:facility-71", ownerTabId: 202, facility_id: 71,
+      sourceType: "facility", status: "lỗi cập nhật", writer_claim_token: "still-owned" }], runner: { active: false, workers: {} } }, { tabGet });
+    await api.reconcileClosedTabJobs();
+    assert.equal(api.state.items[0].owner_tab_closed_at, undefined);
+    assert.equal(api.state.items[0].writer_claim_token, "still-owned");
+    assert.equal(api.hasOtherTabJobInFlight(api.state.items, { id: "new", facility_id: 71, sourceType: "facility" }, 101), true);
+    assert.equal(api.claimCalls.length, 0);
+  }
+});
+
+test("closed pending saves/imports retain leases, receipts, JSON and duplicate guards for every source", async () => {
+  const fixtures = [
+    { sourceType: "facility", facility_id: 71, status: "đang cập nhật" },
+    { sourceType: "doctor", doctor_id: 71, status: "chưa xác nhận", doctor_writer_request_id: "receipt-id" },
+    { sourceType: "facility_image_fix", facility_id: 71, status: "ảnh chưa đủ", image_fix_import_pending: true },
+    { sourceType: "facility_image_fix", facility_id: 71, status: "lỗi cập nhật", image_fix_api_pending: true },
+    { sourceType: "facility", facility_id: 71, status: "lỗi cập nhật", activeRequest: true }
+  ];
+  for (const fixture of fixtures) {
+    const old = { ...fixture, id: "old-71", ownerTabId: 202, writer_claim_token: "pending-token",
+      result: { id: 71, content: "Retain JSON" }, rawResponse: "Exact raw response" };
+    const api = loadBackground({ items: [old], runner: { active: false, workers: {} } });
+    if (fixture.activeRequest) api.activeApiRequests.add(old.id);
+    await api.cleanupClosedTabJobs(202);
+    assert.equal(api.state.items[0].status, fixture.status);
+    assert.equal(api.state.items[0].writer_claim_token, "pending-token");
+    assert.equal(api.state.items[0].writer_claim_release_pending, undefined);
+    assert.equal(api.claimCalls.length, 0);
+    assert.deepEqual(api.state["article-content:old-71"].result, old.result);
+    const candidate = fixture.sourceType === "doctor" ? { id: "new", sourceType: "doctor", doctor_id: 71 }
+      : { id: "new", sourceType: "facility", facility_id: 71 };
+    assert.equal(api.hasOtherTabJobInFlight(api.state.items, candidate, 101), true);
+    // Imports must stay protected even after the successful save cleared its token.
+    if (fixture.image_fix_import_pending) {
+      delete api.state.items[0].writer_claim_token;
+      assert.equal(api.hasOtherTabJobInFlight(api.state.items, candidate, 101), true);
+    }
+  }
+});
+
+test("failed release retains the guard and retries release, while lease_lost only clears the old token", async () => {
+  let fail = true;
+  const api = loadBackground({ items: [{ id: "old", ownerTabId: 202, facility_id: 71, sourceType: "facility",
+    status: "đang viết", writer_claim_token: "old-token", writer_claim_required: true }], runner: { active: false, workers: {} } }, {
+    claimResponse() { return fail ? { status: 503, body: { ok: false, message: "Unavailable" } }
+      : { status: 409, body: { ok: false, reason: "lease_lost" } }; }
+  });
+  api.tabs.delete(202);
+  await api.reconcileClosedTabJobs();
+  const candidate = { id: "new", sourceType: "facility", facility_id: 71 };
+  assert.equal(api.state.items[0].writer_claim_release_pending, true);
+  assert.equal(api.hasOtherTabJobInFlight(api.state.items, candidate, 101), true);
+  fail = false;
+  await api.renewActiveWriterClaims();
+  assert.equal(api.state.items[0].writer_claim_token, undefined);
+  assert.equal(api.hasOtherTabJobInFlight(api.state.items, candidate, 101), false);
+  assert.deepEqual(api.claimCalls.map(({ action }) => action), ["release", "release"]);
+});
+
+test("a late closed-tab release cannot clear a replacement token", async () => {
+  const api = loadBackground({ items: [{ id: "old", ownerTabId: 202, facility_id: 71, sourceType: "facility",
+    status: "lỗi cập nhật", writer_claim_token: "old-token" }], runner: { active: false, workers: {} } }, {
+    claimResponse(body, state) {
+      state.items[0].writer_claim_token = "replacement-token";
+      return { status: 409, body: { ok: false, reason: "lease_lost" } };
+    }
+  });
+  await api.cleanupClosedTabJobs(202);
+  assert.equal(api.state.items[0].writer_claim_token, "replacement-token");
+  assert.equal(api.hasOtherTabJobInFlight(api.state.items, { id: "new", sourceType: "facility", facility_id: 71 }, 101), true);
+  assert.equal(api.claimCalls[0].claim_token, "old-token");
+});
+
+test("retry cannot reuse a closed-tab token while its release is still in flight", async () => {
+  for (const sourceType of ["facility", "facility_image_fix"]) {
+    let releaseDone, releaseStarted;
+    const entered = new Promise((resolve) => { releaseStarted = resolve; });
+    const api = loadBackground({ items: [{ id: "old", ownerTabId: 202, facility_id: 71, sourceType,
+      status: "lỗi cập nhật", writer_claim_token: "old-token", result: { id: 71, content: "Original JSON" } }],
+      runner: { active: false, workers: {} } }, {
+      async claimResponse() {
+        releaseStarted();
+        await new Promise((resolve) => { releaseDone = resolve; });
+        return { status: 200, body: { ok: true, released: true } };
+      }
+    });
+    const closing = api.cleanupClosedTabJobs(202);
+    await entered;
+    try {
+      await assert.rejects(api.retryUpdate("old"), /Đang trả khóa/);
+      assert.equal(api.fetchCalls.length, 0, "no update POST can race the old token release");
+      assert.equal(api.state.items[0].status, "lỗi cập nhật");
+      assert.deepEqual(api.state["article-content:old"].result, { id: 71, content: "Original JSON" });
+    } finally { releaseDone(); await closing; }
+  }
+});
 
 test("failed Spark article keeps its queue slot and retries before the next queued article", async () => {
   const api = loadBackground({ sourceType: "facility", runner: { active: false }, items: [

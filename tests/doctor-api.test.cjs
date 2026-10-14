@@ -63,10 +63,10 @@ function loadBackground(initial = {}, fetchOverride) {
   ]);
   const calls = [], sent = [], alarms = [];
   const retryTimers = [];
-  let alarmListener;
+  let alarmListener, runtimeListener;
   const owned = new Map();
   const chrome = {
-    runtime: { onMessage: { addListener() {} }, onInstalled: { addListener() {} } },
+    runtime: { onMessage: { addListener(listener) { runtimeListener = listener; } }, onInstalled: { addListener() {} } },
     storage: { local: {
       async get(keys) {
         const wanted = keys == null ? Object.keys(state) : Array.isArray(keys) ? keys : [keys];
@@ -144,6 +144,7 @@ function loadBackground(initial = {}, fetchOverride) {
   vm.runInContext(code, context, { filename: "background.js" });
   return { ...context.__doctorApiTests, state, calls, sent, alarms, tabs, owned, retryTimers,
     getAlarmListener() { return alarmListener; },
+    getRuntimeListener() { return runtimeListener; },
     sender(id) { return { tab: plain(tabs.get(id)) }; } };
 }
 
@@ -169,6 +170,106 @@ test("undeployed doctor endpoint and schema errors remain errors, not empty queu
   }
 });
 
+test("an older doctor 503 refresh reply cannot replace the latest HTTP 200 ready queue state", async () => {
+  let enteredFirst, enteredSecond;
+  const firstEntered = new Promise((resolve) => { enteredFirst = resolve; });
+  const secondEntered = new Promise((resolve) => { enteredSecond = resolve; });
+  const replies = [];
+  const retained = doctorJob(12, 101, { status: "chưa xác nhận", result: doctorResult(), writer_claim_token: token,
+    writer_claim_request_id: "kept-attempt", doctor_writer_request_id: "kept-attempt" });
+  const otherQueue = { sourceType: "doctor", status: "ready", httpStatus: 200, count: 1 };
+  const api = loadBackground({ items: [retained], "tab-doctor-queue:202": otherQueue }, (url) => {
+    if (!url.startsWith(DOCTORS_URL)) return undefined;
+    return new Promise((resolve) => {
+      replies.push(resolve);
+      (replies.length === 1 ? enteredFirst : enteredSecond)();
+    });
+  });
+  const request = () => new Promise((resolve) => {
+    const handled = api.getRuntimeListener()({ type: "refresh-queue", sourceType: "doctor", targetTabId: 101 }, api.sender(101), resolve);
+    assert.equal(handled, true);
+  });
+  const older = request();
+  await firstEntered;
+  const latest = request();
+  await secondEntered;
+  replies[1](response({ ok: true, type: "doctor", items: [] }));
+  const freshReply = await latest;
+  assert.equal(freshReply.ok, true);
+  assert.equal(freshReply.queueState.status, "ready");
+  const freshState = plain(api.state["tab-doctor-queue:101"]);
+
+  replies[0](response({ ok: false, message: "Chưa sẵn sàng schema bác sĩ." }, 503));
+  const staleReply = await older;
+
+  assert.equal(staleReply.ok, false, "the old transport failure still reports its own request outcome");
+  assert.match(staleReply.error, /HTTP 503/);
+  assert.deepEqual(plain(staleReply.queueState), freshState, "runtime must return the requestId-protected state, not reconstruct a stale 503 error");
+  assert.deepEqual(plain(api.state["tab-doctor-queue:101"]), freshState);
+  assert.deepEqual(plain(api.state["tab-doctor-queue:202"]), otherQueue);
+  const stored = (await api.jobStorage.get("items")).items[0];
+  assert.deepEqual(plain(stored.result), retained.result);
+  assert.equal(stored.writer_claim_token, token);
+  assert.equal(stored.doctor_writer_request_id, "kept-attempt");
+  assert.equal(api.sent.some((entry) => entry.message.type === "run-article"), false);
+});
+
+test("doctor queue 503 blocks Run until a manual HTTP 200 empty refresh clears only its paused worker error", async () => {
+  let ready = false;
+  const retained = doctorJob(12, 101, { status: "chưa xác nhận", result: doctorResult(), writer_claim_token: token,
+    writer_claim_request_id: "kept-attempt", doctor_writer_request_id: "kept-attempt" });
+  const other = doctorJob(34, 202, { status: "đang viết", workerKey: "tab-202", runToken: "other-run" });
+  const api = loadBackground({ items: [retained, other], runner: { active: true, workers: {
+    "tab-101": { active: false, sourceType: "doctor", provider: "grok", targetTabId: 101, currentId: null,
+      waitReason: "doctor-queue-error", lastError: "API danh sách bác sĩ HTTP 503" },
+    "tab-202": { active: true, sourceType: "doctor", provider: "chatgpt", targetTabId: 202, currentId: other.id, runToken: "other-run" }
+  } } }, (url) => url.startsWith(DOCTORS_URL)
+    ? ready ? response({ ok: true, type: "doctor", items: [] }) : response({ ok: false, message: "Chưa sẵn sàng schema bác sĩ." }, 503)
+    : undefined);
+  await assert.rejects(api.refreshQueue("doctor", "facility", 101), /HTTP 503/);
+  const blocked = await api.startRun({ sourceType: "doctor", targetTabId: 101 }, api.sender(101));
+  assert.equal(blocked.ok, false);
+  assert.equal(blocked.doctorQueueError, true);
+  assert.equal(blocked.queueState.status, "error");
+  assert.equal(api.state.runner.workers["tab-101"].active, false);
+  assert.equal(api.state.runner.workers["tab-202"].active, true);
+
+  ready = true;
+  const refreshed = await api.refreshQueue("doctor", "facility", 101);
+
+  assert.equal(refreshed.ok, true);
+  assert.equal(refreshed.queueState.status, "ready");
+  assert.equal(refreshed.queueState.httpStatus, 200);
+  assert.equal(refreshed.queueState.count, 0);
+  assert.equal(api.state.runner.workers["tab-101"].active, false, "manual refresh never starts an AI worker automatically");
+  assert.equal(api.state.runner.workers["tab-101"].waitReason, undefined);
+  assert.equal(api.state.runner.workers["tab-101"].lastError, null);
+  assert.equal(api.state.runner.workers["tab-202"].active, true);
+  assert.equal(api.state.runner.workers["tab-202"].currentId, other.id);
+  const stored = (await api.jobStorage.get("items")).items.find((item) => item.id === retained.id);
+  assert.deepEqual(plain(stored.result), retained.result);
+  assert.equal(stored.writer_claim_token, token);
+  assert.equal(stored.doctor_writer_request_id, "kept-attempt");
+  assert.equal(api.calls.some((call) => call.body?.action === "claim" || call.body?.action === "release" || call.url.startsWith(UPDATE_URL)), false);
+  assert.equal(api.sent.some((entry) => entry.message.type === "run-article"), false);
+});
+
+test("a doctor queue loading in another panel blocks a direct Run without becoming a stored failure", async () => {
+  const loading = { sourceType: "doctor", status: "loading", requestId: "pending-refresh" };
+  const api = loadBackground({ items: [doctorJob()], "tab-doctor-queue:101": loading });
+
+  const blocked = await api.startRun({ sourceType: "doctor", targetTabId: 101 }, api.sender(101));
+
+  assert.equal(blocked.ok, false);
+  assert.equal(blocked.doctorQueueLoading, true);
+  assert.notEqual(blocked.doctorQueueError, true, "an in-progress request is not an API failure");
+  assert.deepEqual(plain(blocked.queueState), loading);
+  assert.deepEqual(plain(api.state["tab-doctor-queue:101"]), loading);
+  assert.equal(api.state.runner.active, false);
+  assert.equal(api.calls.some((call) => call.body?.action === "claim" || call.url.startsWith(UPDATE_URL)), false);
+  assert.equal(api.sent.some((entry) => entry.message.type === "run-article"), false);
+});
+
 test("doctor payload preserves arrays, objects, nulls and future fields and privately adds its token", () => {
   const api = loadBackground(), job = doctorJob(12, 101, { writer_claim_token: token }), result = doctorResult();
   const payload = api.buildDoctorUpdatePayload(job, result);
@@ -179,6 +280,252 @@ test("doctor payload preserves arrays, objects, nulls and future fields and priv
   assert.throws(() => api.buildDoctorUpdatePayload(job, { ...result, name: "Bác sĩ khác" }), /name|tên|Tên/);
   assert.throws(() => api.buildDoctorUpdatePayload(job, { ...result, name: undefined }), /name|tên|Tên/);
   assert.throws(() => api.buildDoctorUpdatePayload({ ...job, writer_claim_token: null }, result), /token|khóa|Khóa/);
+});
+
+function assertDoctorUrlError(error, field) {
+  assert.equal(error.doctorPayloadError, true, `invalid ${field} needs a local payload error, not a transport error`);
+  assert.equal(error.doctorPayloadField, field);
+  assert.ok(error.message.includes(field), `the error must identify the exact URL path ${field}: ${error.message}`);
+  assert.match(error.message, /URL/);
+  return true;
+}
+
+test("doctor URL preflight rejects malformed root scalars and aliases with exact field errors without coercion", () => {
+  const api = loadBackground(), job = doctorJob(12, 101, { writer_claim_token: token });
+  const fields = ["website_url", "booking_url", "image_url", "professional_profile_url", "practice_registry_url", "website", "booking"];
+  const malformed = [
+    { url: "https://example.org/profile" }, ["https://example.org/profile"], 7, false,
+    "null", "[Hồ sơ](https://example.org/profile)", '<a href="https://example.org/profile">Hồ sơ</a>',
+    "https://user:password@example.org/profile", "data:image/png;base64,aGVsbG8=", "javascript:alert(1)",
+    "ftp://example.org/profile", "/doctor/profile", "https://",
+    "https://-example.org/profile", "https://example-.org/profile", "https://exa..mple.org/profile",
+    "https://.example.org/profile", "https://./profile", "https://éxample.org/profile", "https://example.org/é",
+    "https://%65xample.org/profile", "https://example%2eorg/profile", "https://" + "a".repeat(64) + ".org/profile"
+  ];
+  for (const field of fields) {
+    for (const value of malformed) {
+      const result = doctorResult(12, undefined, { [field]: value }), before = plain(result);
+      assert.throws(() => api.buildDoctorUpdatePayload(job, result), (error) => assertDoctorUrlError(error, field),
+        `must reject ${field}=${JSON.stringify(value)}`);
+      assert.deepEqual(result, before, `rejecting ${field} must not stringify, flatten or discard the original value`);
+    }
+  }
+  for (const field of ["website_url", "booking_url", "professional_profile_url", "practice_registry_url"]) {
+    const prefix = "https://example.org/";
+    const tooLong = prefix + "a".repeat(4001 - prefix.length);
+    assert.throws(() => api.buildDoctorUpdatePayload(job, doctorResult(12, undefined, { [field]: tooLong })),
+      (error) => assertDoctorUrlError(error, field));
+    const overByteLimit = prefix + "é".repeat(2000);
+    assert.ok(Buffer.byteLength(overByteLimit, "utf8") > 4000 && overByteLimit.length < 4000);
+    assert.throws(() => api.buildDoctorUpdatePayload(job, doctorResult(12, undefined, { [field]: overByteLimit })),
+      (error) => assertDoctorUrlError(error, field));
+  }
+  const imagePrefix = "https://example.org/";
+  assert.throws(() => api.buildDoctorUpdatePayload(job, doctorResult(12, undefined, {
+    image_url: imagePrefix + "a".repeat(256 - imagePrefix.length)
+  })), (error) => assertDoctorUrlError(error, "image_url"));
+  for (const [field, maximum] of [["image_url", 255], ["website_url", 4000]]) {
+    assert.throws(() => api.buildDoctorUpdatePayload(job, doctorResult(12, undefined, {
+      [field]: " ".repeat(maximum + 1) + "https://example.org/profile"
+    })), (error) => assertDoctorUrlError(error, field), "root text length is checked before trimming, matching the backend");
+  }
+  assert.equal(api.calls.length, 0, "local preflight never contacts an API");
+});
+
+test("doctor URL preflight validates required list URLs and every nested URL using indexed paths", () => {
+  const api = loadBackground(), job = doctorJob(12, 101, { writer_claim_token: token });
+  const invalid = [
+    ["gallery_json[1].url", { gallery_json: [{ url: "https://example.org/portrait.jpg" }, { url: null }] }],
+    ["gallery_json[0].url", { gallery_json: [{}] }],
+    ["gallery_json[0].url", { gallery_json: ["[Ảnh](https://example.org/portrait.jpg)"] }],
+    ["sources_json[0].url", { sources_json: [{ id: "s1", url: null }] }],
+    ["sources_json[0].url", { sources_json: [{ id: "s1", url: ["https://example.org/profile"] }] }],
+    ["social_links_json[facebook]", { social_links_json: { facebook: { url: "https://example.org/facebook" } } }],
+    ["social_links_json[facebook]", { social_links_json: { facebook: null } }],
+    ["video_urls_json[1]", { video_urls_json: ["https://example.org/video", null] }],
+    ["video_urls_json[0]", { video_urls_json: [{ url: "https://example.org/video" }] }],
+    ["publications_json[0].url", { publications_json: [{ title: "Bài nghiên cứu", url: { href: "https://example.org/publication" }, source_ids: ["s1"] }] }],
+    ["legal_documents_json[1].url", { legal_documents_json: [{ title: "Giấy tờ", url: null }, { title: "Giấy tờ khác", url: false }] }],
+    ["locations_json[0].website_url", { locations_json: [{ facility_name: "Bệnh viện", website_url: [], booking_url: null, source_ids: ["s1"] }] }],
+    ["locations_json[0].booking_url", { locations_json: [{ facility_name: "Bệnh viện", website_url: null, booking_url: 8, source_ids: ["s1"] }] }],
+    ["education_json[0].details.links[0].url", { education_json: [{ institution: "Đại học Y", source_ids: ["s1"], details: { links: [{ url: { value: "https://example.org/school" } }] } }] }],
+    ["evidence_json.conflicts[0].reference.website_url", { evidence_json: { identity_status: "matched", conflicts: [{ reference: { website_url: ["https://example.org/conflict"] } }] } }],
+    ["practice_license_json.reference.booking_url", { practice_license_json: { source_ids: ["s1"], reference: { booking_url: false } } }],
+    ["locations_json[0].schedule_json[0].url", { locations_json: [{ facility_name: "Bệnh viện", source_ids: ["s1"], schedule_json: [{ url: "data:text/plain,schedule" }] }] }],
+    ["education_json[0].url", { education_json: JSON.stringify([{ institution: "Đại học Y", source_ids: ["s1"], url: { href: "https://example.org/school" } }]) }]
+  ];
+  for (const [field, extra] of invalid) {
+    const result = doctorResult(12, undefined, extra), before = plain(result);
+    assert.throws(() => api.buildDoctorUpdatePayload(job, result), (error) => assertDoctorUrlError(error, field), `must reject ${field}`);
+    assert.deepEqual(result, before, `invalid ${field} must remain available for the editor to correct`);
+  }
+  for (const [field, extra] of [
+    ["gallery_json[0].url", { gallery_json: [{ url: "" }] }],
+    ["sources_json[0].url", { sources_json: [{ id: "s1", url: "" }] }],
+    ["social_links_json[facebook]", { social_links_json: { facebook: "" } }],
+    ["video_urls_json[0]", { video_urls_json: [""] }]
+  ]) assert.throws(() => api.buildDoctorUpdatePayload(job, doctorResult(12, undefined, extra)),
+    (error) => assertDoctorUrlError(error, field));
+  assert.equal(api.calls.length, 0);
+});
+
+test("doctor URL preflight preserves valid nullable, legacy and nested URL payloads exactly", () => {
+  const api = loadBackground(), job = doctorJob(12, 101, { writer_claim_token: token });
+  const prefix = "https://example.org/";
+  const result = doctorResult(12, undefined, {
+    website_url: "", booking_url: null, professional_profile_url: prefix + "a".repeat(4000 - prefix.length), practice_registry_url: null,
+    image_url: prefix + "p".repeat(255 - prefix.length),
+    gallery_json: [{ url: "https://example.org/portrait.jpg", caption: "Ảnh thật", source_ids: ["s1"] }, "https://example.org/legacy.jpg"],
+    social_links_json: { facebook: "https://example.org/doctor/facebook", youtube: "https://example.org/doctor/channel" },
+    video_urls_json: ["https://example.org/doctor/video"],
+    publications_json: [{ title: "Bài nghiên cứu", url: null, source_ids: ["s1"] }, { title: "Bài khác", url: "https://example.org/paper", source_ids: ["s1"] }],
+    legal_documents_json: [{ title: "Tài liệu", url: null, source_ids: ["s1"] }],
+    locations_json: [{ facility_name: "Bệnh viện A", website_url: "https://example.org/hospital", booking_url: null,
+      source_ids: ["s1"], schedule_json: [{ url: null, day: "Thứ hai", source_ids: ["s1"] }] }],
+    education_json: JSON.stringify([{ institution: "Đại học Y", source_ids: ["s1"], url: "https://example.org/school" }]),
+    evidence_json: { identity_status: "matched", missing_fields: [], conflicts: [], reference: { url: null,
+      links: [{ website_url: "https://example.org/profile", booking_url: null }] } },
+    future_editorial_field: { url: { unknown_contract_kept: true }, nested: [false, null] }
+  });
+  const before = plain(result);
+  assert.deepEqual(plain(api.buildDoctorUpdatePayload(job, result)), { items: [{ ...before, writer_claim_token: token }] });
+  assert.deepEqual(result, before, "URL checking must not normalize or delete valid original fields");
+  const aliases = doctorResult(12, undefined, { website: "https://example.org/website", booking: null });
+  assert.deepEqual(plain(api.buildDoctorUpdatePayload(job, aliases).items[0]), { ...aliases, writer_claim_token: token });
+  const unknowns = doctorResult(12, undefined, {
+    website_url: null, booking_url: "", image_url: null, professional_profile_url: null, practice_registry_url: "",
+    social_links_json: [], video_urls_json: [], gallery_json: []
+  });
+  assert.deepEqual(plain(api.buildDoctorUpdatePayload(job, unknowns).items[0]), { ...unknowns, writer_claim_token: token });
+  assert.equal(api.calls.length, 0);
+});
+
+test("doctor payload adapts native and legacy social-link pairs only for transport and preserves the full AI record", async () => {
+  const platform = "Website Hệ thống Y tế Thu Cúc TCI";
+  const pairs = [
+    { platform, url: "https://benhvienthucuc.vn" },
+    { platform: "  facebook  ", url: "https://example.org/doctor/facebook" },
+    { platform: "__proto__", url: "https://example.org/doctor/profile" },
+    { platform: "Đ".repeat(190), url: "https://example.org/doctor/official" }
+  ];
+  const canonical = Object.fromEntries(pairs.map((entry) => [entry.platform.trim(), entry.url]));
+  for (const socialLinks of [pairs, JSON.stringify(pairs, null, 2)]) {
+    const job = doctorJob(12, 101, {
+      writer_claim_token: token, writer_claim_request_id: "social-links-attempt"
+    });
+    const api = loadBackground({ items: [job] });
+    const result = doctorResult(12, undefined, { social_links_json: socialLinks,
+      future_editorial_field: { nullable: null, values: [1, false, { evidence: "kept" }], url: { unknown_contract_kept: true } } });
+    const before = plain(result);
+    const expected = { items: [{ ...before, social_links_json: canonical, writer_claim_token: token }] };
+
+    assert.deepEqual(plain(api.buildDoctorUpdatePayload(job, result)), expected);
+    assert.deepEqual(result, before, "building transport JSON must not rewrite the native or JSON-encoded AI social links");
+    assert.equal(api.calls.length, 0, "the builder and preflight remain local");
+
+    await api.updateDoctorContent(job, result);
+
+    assert.equal(api.calls.length, 1);
+    assert.equal(api.calls[0].url, UPDATE_URL);
+    assert.deepEqual(api.calls[0].body, expected, "native and legacy pairs must both POST a canonical object with all other fields intact");
+    assert.deepEqual(result, before);
+    assert.equal(result.writer_claim_token, undefined);
+  }
+});
+
+test("doctor payload keeps canonical native and JSON-encoded social-link objects byte-for-byte unchanged", () => {
+  const api = loadBackground(), job = doctorJob(12, 101, { writer_claim_token: token });
+  const canonical = { "Website Hệ thống Y tế Thu Cúc TCI": "https://benhvienthucuc.vn",
+    "  facebook  ": " https://example.org/doctor/facebook " };
+  for (const socialLinks of [canonical, JSON.stringify(canonical, null, 2), [], " [] ", null]) {
+    const result = doctorResult(12, undefined, { social_links_json: socialLinks });
+    const before = plain(result);
+    assert.deepEqual(plain(api.buildDoctorUpdatePayload(job, result)), { items: [{ ...before, writer_claim_token: token }] });
+    assert.deepEqual(result, before, "canonical data and legacy formatting must not be normalized as a compatibility list");
+  }
+  assert.equal(api.calls.length, 0);
+});
+
+test("doctor social-link compatibility rejects ambiguous pairs with exact indexed paths and no mutation or POST", async () => {
+  const api = loadBackground(), job = doctorJob(12, 101, { writer_claim_token: token });
+  const validUrl = "https://benhvienthucuc.vn";
+  const invalid = [
+    ["social_links_json[0].platform", [{ url: validUrl }]],
+    ...[null, 7, false, {}, [], "", " \t\n ", "a".repeat(191), "  " + "a".repeat(189), "Facebook\0Official", "Đ".repeat(191)]
+      .map((platform) => ["social_links_json[0].platform", [{ platform, url: validUrl }]]),
+    ["social_links_json[0].url", [{ platform: "Website" }]],
+    ...[null, "", " ", 7, false, { url: validUrl }, [validUrl], "javascript:alert(1)", "ftp://example.org/profile",
+      "[Website](https://benhvienthucuc.vn)", "https://user:password@example.org/profile", "/doctor/profile"]
+      .map((url) => ["social_links_json[0].url", [{ platform: "Website", url }]]),
+    ["social_links_json[1].platform", [{ platform: "facebook", url: validUrl }, { platform: " facebook ", url: validUrl }]],
+    ["social_links_json[0].source_ids", [{ platform: "Website", url: validUrl, source_ids: ["s1"] }]],
+    ["social_links_json[0].alternative_url", [{ platform: "Website", url: validUrl, alternative_url: "https://example.org/profile" }]],
+    ["social_links_json[0].", [{ platform: "Website", url: validUrl, "": { evidence: "must not discard" } }]],
+    ...[validUrl, null, 7, false, [validUrl]].map((entry) => ["social_links_json[0]", [entry]]),
+    ["social_links_json.platform", [{ platform: "0", url: validUrl }]],
+    ["social_links_json.platform", [{ platform: "0", url: validUrl }, { platform: "1", url: validUrl }]],
+    ["social_links_json.platform", [{ platform: "1", url: validUrl }, { platform: "0", url: validUrl }]]
+  ];
+  for (const [field, pairs] of invalid) {
+    for (const socialLinks of [pairs, JSON.stringify(pairs)]) {
+      const result = doctorResult(12, undefined, { social_links_json: socialLinks }), before = plain(result);
+      assert.throws(() => api.buildDoctorUpdatePayload(job, result), (error) => assertDoctorUrlError(error, field),
+        `must reject ${field}=${JSON.stringify(socialLinks)}`);
+      await assert.rejects(api.updateDoctorContent(job, result), (error) => assertDoctorUrlError(error, field));
+      assert.deepEqual(result, before, "failed compatibility conversion must retain all original pairs, including extra evidence fields");
+    }
+  }
+  assert.equal(api.calls.length, 0, "all malformed social-link results must be rejected before contacting the doctor endpoint");
+});
+
+test("doctor completion sends normalized social links but stores the original full native or legacy JSON and raw response", async () => {
+  const pairs = [{ platform: "Website Hệ thống Y tế Thu Cúc TCI", url: "https://benhvienthucuc.vn" }];
+  const canonical = { "Website Hệ thống Y tế Thu Cúc TCI": "https://benhvienthucuc.vn" };
+  for (const socialLinks of [pairs, JSON.stringify(pairs)]) {
+    const result = doctorResult(12, undefined, { social_links_json: socialLinks }), before = plain(result);
+    const rawResponse = "```json\n" + JSON.stringify(result, null, 2) + "\n```";
+    const api = loadBackground({ items: [doctorJob()] });
+    await api.startRun({ sourceType: "doctor", targetTabId: 101 }, api.sender(101));
+    const worker = plain(api.state.runner.workers["tab-101"]);
+
+    const completed = await api.handleArticleComplete({ articleId: worker.currentId, runToken: worker.runToken,
+      article: result, rawResponse }, api.sender(101));
+
+    assert.equal(completed.updated, true);
+    const posts = api.calls.filter((call) => call.url.startsWith(UPDATE_URL));
+    assert.equal(posts.length, 1);
+    assert.deepEqual(posts[0].body, { items: [{ ...before, social_links_json: canonical, writer_claim_token: token }] });
+    const stored = (await api.jobStorage.get("items")).items.find((item) => item.doctor_id === 12);
+    assert.equal(stored.status, "hoàn tất");
+    assert.equal(stored.has_result, true);
+    assert.deepEqual(plain(stored.result), before, "the saved audit result is the full original AI JSON, not the transport adaptation");
+    assert.equal(stored.rawResponse, rawResponse);
+    assert.deepEqual(result, before);
+    assert.equal(api.calls.some((call) => call.url.includes("facility-content-update.php")), false);
+  }
+});
+
+test("malformed doctor URL completion retains full JSON and raw output without sending a POST", async () => {
+  const invalid = doctorResult(12, undefined, { website_url: { url: "https://example.org/doctor" },
+    future_editorial_field: { nullable: null, nested: [1, false, { original: "kept" }] } });
+  const api = loadBackground({ items: [doctorJob()] });
+  await api.startRun({ sourceType: "doctor", targetTabId: 101 }, api.sender(101));
+  const worker = plain(api.state.runner.workers["tab-101"]);
+  const rawResponse = "```json\n" + JSON.stringify(invalid) + "\n```";
+  const completed = await api.handleArticleComplete({ articleId: worker.currentId, runToken: worker.runToken,
+    article: invalid, rawResponse }, api.sender(101));
+  assert.equal(completed.updated, false);
+  const stored = (await api.jobStorage.get("items")).items.find((item) => item.doctor_id === 12);
+  assert.equal(stored.status, "lỗi cập nhật");
+  assert.equal(stored.has_result, true);
+  assert.deepEqual(plain(stored.result), invalid, "the complete malformed research stays recoverable, not replaced by a sanitized subset");
+  assert.equal(stored.rawResponse, rawResponse);
+  assert.match(stored.api_error, /website_url/);
+  assert.match(stored.api_error, /URL/);
+  assert.equal(api.calls.some((call) => call.url.startsWith(UPDATE_URL)), false, "preflight rejects the result before any doctor update request");
+  const direct = loadBackground(), job = doctorJob(12, 101, { writer_claim_token: token });
+  await assert.rejects(direct.updateDoctorContent(job, invalid), (error) => assertDoctorUrlError(error, "website_url"));
+  assert.equal(direct.calls.length, 0, "the direct update path also guards against malformed URL submissions");
 });
 
 test("doctor payload cannot modify operational fields or omit the current server contract", () => {
@@ -489,6 +836,37 @@ test("doctor manual retry of an unsaved result keeps its original claim attempt 
   assert.equal(api.sent.some((entry) => entry.message.type === "run-article"), false);
 });
 
+test("doctor manual retry of a prior social-link shape error sends the full normalized record on its doctor endpoint", async () => {
+  const pairs = [{ platform: "Website Hệ thống Y tế Thu Cúc TCI", url: "https://benhvienthucuc.vn" }];
+  const canonical = { "Website Hệ thống Y tế Thu Cúc TCI": "https://benhvienthucuc.vn" };
+  const configuredUrl = "https://doctor-api.example.org/doctor-content-update.php";
+  for (const socialLinks of [pairs, JSON.stringify(pairs)]) {
+    const original = doctorResult(12, undefined, { social_links_json: socialLinks });
+    const rawResponse = "```json\n" + JSON.stringify(original, null, 2) + "\n```";
+    const job = doctorJob(12, 101, { status: "lỗi cập nhật", result: original, rawResponse, has_result: true,
+      api_error: "social_links_json: cần object tên nền tảng:chuỗi URL hoặc mảng rỗng [].",
+      doctor_writer_request_id: "prior-social-attempt", writer_claim_request_id: "prior-social-attempt",
+      workerKey: "tab-101", provider: "grok" });
+    const api = loadBackground({ items: [job], "tab-api-settings:101": { doctorUpdateUrl: configuredUrl } },
+      (url, options, body) => url === configuredUrl ? response({ ok: true, updated_count: 1,
+        updated: [{ id: body.items[0].id, writer_request_id: "prior-social-attempt", insufficient_data: false, writer_released: true }], errors: [] }) : undefined);
+
+    const retried = await api.retryUpdate(job.id);
+
+    assert.equal(retried.ok, true);
+    const updates = api.calls.filter((call) => call.options.method === "POST" && call.body?.items);
+    assert.equal(updates.length, 1);
+    assert.equal(updates[0].url, configuredUrl, "a stored doctor retry must retain that tab's doctor endpoint");
+    assert.deepEqual(updates[0].body, { items: [{ ...original, social_links_json: canonical, writer_claim_token: token }] });
+    assert.equal(api.calls.find((call) => call.body?.action === "claim").body.request_id, "prior-social-attempt");
+    const stored = (await api.jobStorage.get("items")).items.find((item) => item.id === job.id);
+    assert.equal(stored.status, "hoàn tất");
+    assert.deepEqual(plain(stored.result), original);
+    assert.equal(stored.rawResponse, rawResponse);
+    assert.equal(api.sent.some((entry) => entry.message.type === "run-article"), false, "manual retry must not rerun the AI prompt");
+  }
+});
+
 test("periodic runner recovery confirms cold doctor save before scheduling another job", async () => {
   const job = doctorJob(12, 101, { status: "đang cập nhật", result: doctorResult(),
     doctor_writer_request_id: "attempt-12", writer_claim_request_id: "attempt-12",
@@ -611,4 +989,192 @@ test("doctor save lease_lost response remains a terminal stale-result marker aft
   assert.equal(stored.has_result, true);
   await assert.rejects(api.retryUpdate(stored.id), /Khóa bác sĩ đã mất/);
   assert.equal(api.calls.filter((call) => call.url.startsWith(UPDATE_URL)).length, 1);
+});
+
+function doctorLegalFields() {
+  return {
+    professional_profile_url: "https://example.org/doctor/12",
+    practice_license_type: "Giấy phép hành nghề", practice_license_number: "012345/AB",
+    practice_license_issuer: "Sở Y tế", practice_license_issued_date: "2024-02-29",
+    practice_license_scope: "Nội khoa", practice_registry_url: null,
+    practice_registration_json: [{ facility_name: "Bệnh viện A", department: "Nội khoa",
+      scope: null, schedule_text: "Theo lịch công khai", source_ids: ["s1"] }],
+    legal_documents_json: [{ document_type: "Giấy phép", title: "Thông tin công khai",
+      number: "012345/AB", issuer: "Sở Y tế", issued_date: "2024-02-29", url: null, source_ids: ["s1"] }],
+    legal_notes: "Chỉ ghi thông tin có nguồn; không kết luận hiệu lực giấy phép.", legal_source_ids_json: ["s1"]
+  };
+}
+
+test("all 11 additive legal fields preserve their types and values and follow the dynamic template", () => {
+  const api = loadBackground(), legal = doctorLegalFields();
+  assert.equal(Object.keys(legal).length, 11);
+  const result = doctorResult(12, undefined, legal);
+  const job = doctorJob(12, 101, { writer_claim_token: token,
+    output_template: { ...doctorSource().output_template, ...Object.fromEntries(Object.keys(legal).map((key) => [key, null])) } });
+  const before = plain(result);
+  assert.deepEqual(plain(api.buildDoctorUpdatePayload(job, result)), { items: [{ ...result, writer_claim_token: token }] });
+  assert.deepEqual(result, before);
+  for (const key of Object.keys(legal)) {
+    const incomplete = { ...result };
+    delete incomplete[key];
+    assert.throws(() => api.buildDoctorUpdatePayload(job, incomplete), new RegExp(key));
+  }
+});
+
+test("fatal doctor heartbeat pauses only its tab and preserves late complete JSON without a POST", async () => {
+  for (const status of [401, 403, 503]) {
+    for (const body of [{ ok: false, message: "Heartbeat unavailable" }, "<html>Heartbeat unavailable</html>"]) {
+      const api = loadBackground({ items: [doctorJob(12, 101), doctorJob(34, 202)] }, (url, options, request) =>
+        url.startsWith(CLAIM_URL) && request.action === "heartbeat" && request.id === 12 ? response(body, status) : undefined);
+      await Promise.all([api.startRun({ sourceType: "doctor", targetTabId: 101 }, api.sender(101)),
+        api.startRun({ sourceType: "doctor", targetTabId: 202 }, api.sender(202))]);
+      const worker = plain(api.state.runner.workers["tab-101"]);
+      const original = plain(api.state.items.find((item) => item.doctor_id === 12));
+      await api.heartbeatActiveWriterClaims();
+      assert.equal(api.state.runner.workers["tab-101"].active, false);
+      assert.equal(api.state.runner.workers["tab-202"].active, true);
+      assert.equal(api.state["tab-doctor-queue:101"].httpStatus, status);
+      assert.ok(api.sent.some((entry) => entry.id === 101 && entry.message.type === "stop-article"));
+      assert.equal(api.sent.some((entry) => entry.id === 202 && entry.message.type === "stop-article"), false);
+      const result = doctorResult(12, undefined, doctorLegalFields());
+      await api.handleArticleComplete({ articleId: worker.currentId, runToken: "stale-run", article: result }, api.sender(101));
+      assert.equal(api.state.items.find((item) => item.doctor_id === 12).has_result, false);
+      const completed = await api.handleArticleComplete({ articleId: worker.currentId, runToken: worker.runToken,
+        article: result, rawResponse: "complete legal research JSON" }, api.sender(101));
+      assert.equal(completed.updated, false);
+      const stored = (await api.jobStorage.get("items")).items.find((item) => item.doctor_id === 12);
+      assert.deepEqual(plain(stored.result), result);
+      assert.equal(stored.rawResponse, "complete legal research JSON");
+      assert.equal(stored.writer_claim_token, original.writer_claim_token);
+      assert.equal(stored.writer_claim_request_id, original.writer_claim_request_id);
+      assert.equal(stored.doctor_writer_request_id, original.doctor_writer_request_id);
+      assert.equal(api.calls.some((call) => call.url.startsWith(UPDATE_URL)), false);
+      assert.equal(api.calls.some((call) => call.body?.action === "release"), false);
+    }
+  }
+});
+
+test("fatal doctor heartbeat at completion retains the entire result and does not submit", async () => {
+  for (const status of [401, 403, 503]) {
+    const api = loadBackground({ items: [doctorJob()] }, (url, options, request) =>
+      url.startsWith(CLAIM_URL) && request.action === "heartbeat" ? response({ ok: false, message: "Heartbeat unavailable" }, status) : undefined);
+    await api.startRun({ sourceType: "doctor", targetTabId: 101 }, api.sender(101));
+    const worker = plain(api.state.runner.workers["tab-101"]);
+    const result = doctorResult(12, undefined, doctorLegalFields());
+    const completed = await api.handleArticleComplete({ articleId: worker.currentId, runToken: worker.runToken,
+      article: result, rawResponse: "full response" }, api.sender(101));
+    assert.equal(completed.paused, true);
+    const stored = (await api.jobStorage.get("items")).items[0];
+    assert.deepEqual(plain(stored.result), result);
+    assert.equal(stored.rawResponse, "full response");
+    assert.equal(api.state.runner.workers["tab-101"].active, false);
+    assert.equal(api.calls.some((call) => call.url.startsWith(UPDATE_URL)), false);
+  }
+});
+
+test("doctor manual retry retains the original lease on fatal heartbeat and resends only JSON after recovery", async () => {
+  let unavailable = true;
+  const api = loadBackground({ items: [doctorJob()] }, (url, options, request) =>
+    url.startsWith(CLAIM_URL) && request.action === "heartbeat" && unavailable
+      ? response({ ok: false, message: "Heartbeat unavailable" }, 503) : undefined);
+  await api.startRun({ sourceType: "doctor", targetTabId: 101 }, api.sender(101));
+  const worker = plain(api.state.runner.workers["tab-101"]);
+  await api.handleArticleComplete({ articleId: worker.currentId, runToken: worker.runToken,
+    article: doctorResult(), rawResponse: "kept research" }, api.sender(101));
+  const original = plain(api.state.items[0]);
+  const failedRetry = await api.retryUpdate(worker.currentId);
+  assert.equal(failedRetry.ok, false);
+  assert.equal(api.state.items[0].writer_claim_token, original.writer_claim_token);
+  assert.equal(api.state.items[0].writer_claim_request_id, original.writer_claim_request_id);
+  assert.equal(api.state.items[0].doctor_writer_request_id, original.doctor_writer_request_id);
+  assert.equal(api.calls.some((call) => call.body?.action === "release"), false);
+  assert.equal(api.calls.some((call) => call.url.startsWith(UPDATE_URL)), false);
+  unavailable = false;
+  assert.equal((await api.retryUpdate(worker.currentId)).ok, true);
+  assert.equal(api.calls.filter((call) => call.body?.action === "claim").length, 1);
+  assert.equal(api.calls.filter((call) => call.url.startsWith(UPDATE_URL)).length, 1);
+  assert.equal(api.sent.filter((entry) => entry.message.type === "run-article").length, 1);
+  const stored = (await api.jobStorage.get("items")).items[0];
+  assert.equal(stored.status, "hoàn tất");
+  assert.equal(stored.rawResponse, "kept research");
+  assert.equal(stored.doctor_heartbeat_halt, undefined);
+});
+
+test("fatal heartbeat during a pending doctor POST never releases or duplicates its receipt lease", async () => {
+  let fatal = false, resolvePost, enteredPost;
+  const entered = new Promise((resolve) => { enteredPost = resolve; });
+  const api = loadBackground({ items: [doctorJob(12), doctorJob(34)] }, (url, options, request, context) => {
+    if (url.startsWith(CLAIM_URL) && request.action === "heartbeat" && fatal) return response({ ok: false, message: "Heartbeat unavailable" }, 503);
+    if (url.startsWith(UPDATE_URL)) {
+      enteredPost();
+      return new Promise((resolve) => { resolvePost = () => {
+        const job = context.state.items.find((item) => item.doctor_id === 12);
+        const updated = [{ id: 12, writer_request_id: job.doctor_writer_request_id, insufficient_data: false }];
+        resolve(response({ ok: true, updated_count: 1, updated, errors: [] }));
+      }; });
+    }
+    return undefined;
+  });
+  await api.startRun({ sourceType: "doctor", targetTabId: 101 }, api.sender(101));
+  const worker = plain(api.state.runner.workers["tab-101"]);
+  const finishing = api.handleArticleComplete({ articleId: worker.currentId, runToken: worker.runToken,
+    article: doctorResult(), rawResponse: "full JSON" }, api.sender(101));
+  await entered;
+  const original = plain(api.state.items.find((item) => item.doctor_id === 12));
+  fatal = true;
+  await api.heartbeatActiveWriterClaims();
+  const pending = (await api.jobStorage.get("items")).items.find((item) => item.doctor_id === 12);
+  assert.equal(pending.status, "đang cập nhật");
+  assert.equal(pending.writer_claim_token, original.writer_claim_token);
+  assert.equal(pending.doctor_writer_request_id, original.doctor_writer_request_id);
+  assert.deepEqual(plain(pending.result), doctorResult());
+  assert.equal(pending.rawResponse, "full JSON");
+  assert.equal(api.state.runner.workers["tab-101"].active, false);
+  assert.equal(api.calls.some((call) => call.body?.action === "release"), false);
+  resolvePost();
+  await finishing;
+  assert.equal(api.state.items.find((item) => item.doctor_id === 12).status, "hoàn tất");
+  assert.equal(api.state.runner.workers["tab-101"].active, false);
+  assert.equal(api.calls.filter((call) => call.url.startsWith(UPDATE_URL)).length, 1);
+  assert.equal(api.sent.filter((entry) => entry.message.type === "run-article").length, 1);
+});
+
+test("a transient doctor heartbeat network error still lets the atomic update validate its token", async () => {
+  const api = loadBackground({ items: [doctorJob()] }, (url, options, request) => {
+    if (url.startsWith(CLAIM_URL) && request.action === "heartbeat") throw new Error("Transient network error");
+    return undefined;
+  });
+  await api.startRun({ sourceType: "doctor", targetTabId: 101 }, api.sender(101));
+  const worker = plain(api.state.runner.workers["tab-101"]);
+  const completed = await api.handleArticleComplete({ articleId: worker.currentId, runToken: worker.runToken,
+    article: doctorResult() }, api.sender(101));
+  assert.equal(completed.updated, true);
+  assert.equal(api.calls.filter((call) => call.url.startsWith(UPDATE_URL)).length, 1);
+});
+
+test("non-JSON doctor upload auth/schema responses retain HTTP status and pause without dropping JSON", async () => {
+  for (const status of [401, 403, 503]) {
+    const api = loadBackground({ items: [doctorJob()] }, (url) => url.startsWith(UPDATE_URL)
+      ? response("<html>Upstream unavailable</html>", status) : undefined);
+    await api.startRun({ sourceType: "doctor", targetTabId: 101 }, api.sender(101));
+    const worker = plain(api.state.runner.workers["tab-101"]);
+    await api.handleArticleComplete({ articleId: worker.currentId, runToken: worker.runToken,
+      article: doctorResult(), rawResponse: "original JSON" }, api.sender(101));
+    assert.equal(api.state.runner.workers["tab-101"].active, false);
+    const stored = (await api.jobStorage.get("items")).items[0];
+    assert.equal(stored.status, "lỗi cập nhật");
+    assert.deepEqual(plain(stored.result), doctorResult());
+    assert.equal(stored.rawResponse, "original JSON");
+    assert.match(stored.api_error, new RegExp(`HTTP ${status}`));
+  }
+});
+
+test("doctor receipt failures preserve HTTP status for both JSON and non-JSON responses", async () => {
+  for (const status of [401, 403, 503]) {
+    for (const body of [{ ok: false, message: "Read unavailable" }, "<html>Read unavailable</html>"]) {
+      const api = loadBackground({}, (url) => url.startsWith(CONTENT_URL) ? response(body, status) : undefined);
+      await assert.rejects(api.readDoctorReceipt(doctorJob(12, 101, { doctor_writer_request_id: "attempt-12" })),
+        (error) => error.httpStatus === status && error.message.includes(`HTTP ${status}`));
+    }
+  }
 });

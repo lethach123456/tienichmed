@@ -35,6 +35,12 @@
         <label class="source-picker">Nguồn tác vụ<select id="sourceType"><option value="facility">Cơ sở y tế</option><option value="doctor">Viết hồ sơ bác sĩ</option><option value="facility_image_fix">Fix ảnh cơ sở y tế</option><option value="toplist">Toplist</option><option value="ai-image">Tạo ảnh AI</option><option value="translation">Dịch Việt → Anh</option></select></label>
         <label id="translationTypeWrap" class="source-picker" hidden>Loại dữ liệu<select id="translationType"><option value="facility">Cơ sở y tế</option><option value="doctor">Bác sĩ</option><option value="toplist">Toplist</option></select></label>
         <p id="providerCapabilityHint" class="provider-capability-hint" role="status" hidden></p>
+        <section id="queueLoadError" class="queue-load-error" role="alert" aria-labelledby="queueErrorTitle" hidden>
+          <strong id="queueErrorTitle">Không tải được hồ sơ bác sĩ</strong>
+          <p id="queueErrorMessage"></p>
+          <details><summary>Hướng dẫn khắc phục</summary><p id="queueErrorHelp"></p></details>
+          <button id="queueRetry" type="button" class="queue-retry">Thử lại</button>
+        </section>
         <div id="items" class="list-scroll queue-list"></div>
       </section>
       <section class="card results-card" aria-labelledby="resultsHeading">
