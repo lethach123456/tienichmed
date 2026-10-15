@@ -347,13 +347,15 @@ async function runArticleAttempt(article, prompt, startupTiming) {
     imageFixArticle: article.sourceType === "facility_image_fix" ? article : null
   });
   if (handbookImages && response.directImage) {
+    await waitForHandbookIdle(article.id, article.runToken);
     const generated = freshHandbookImages(handbookImages);
     if (!generated.length) throw MedReviewHandbook.error("missing_images", "Không xác định được file minh hoạ thuộc đúng bài Cẩm nang.");
     const previousJson = latestAssistantResponse();
-    const followup = await waitForInput();
-    const followupPrompt = `Đã nhận ${generated.length} file minh hoạ do công cụ tạo cho bài Cẩm nang id ${article.handbook_id}, language ${article.language}. Hãy trả TOÀN BỘ JSON cuối cùng theo đúng schema trong yêu cầu trước, giữ nội dung đầy đủ. Không bịa BASE64. Trong content_html dùng chính xác src="handbook-image:1" đến src="handbook-image:${generated.length}" theo thứ tự file vừa tạo để tiện ích gắn bytes ảnh thật. Chỉ trả một block code json, không token hoặc revision.`;
+    let followup = await waitForInput();
+    const followupPrompt = handbookJsonAfterImagesPrompt(article, generated.length);
     setInputValue(followup, followupPrompt);
     if (PROVIDER === "chatgpt" && !await waitForPromptInComposer(followup, followupPrompt, 20000)) throw new Error("Chưa điền đủ yêu cầu nhận HTML Cẩm nang.");
+    followup = await waitForHandbookIdle(article.id, article.runToken, followup);
     if (!await submitPrompt(followup)) throw new Error("Không gửi được yêu cầu nhận JSON Cẩm nang sau tạo ảnh.");
     response = await waitForResponse(previousJson, article.id, ARTICLE_WAIT_TIMEOUT_MS, expected, { runToken: article.runToken });
     handbookImages.bound = generated;
@@ -876,23 +878,51 @@ function clearJsonFormatRetryState(articleId, runToken) {
   try { sessionStorage.removeItem(jsonFormatRetryKey(articleId, runToken)); } catch {}
 }
 
+function handbookInlineJsonRules() {
+  return [
+    "ĐẦU RA CẨM NANG BẮT BUỘC: khi hoàn tất, in TOÀN BỘ JSON trực tiếp trong chat, trong ĐÚNG MỘT block code mở bằng ```json và đóng bằng ```; không giải thích bên ngoài block.",
+    "Không dùng file .json, link Tải JSON hoàn chỉnh, sandbox:/mnt/data, Canvas hoặc artifact thay cho block code. Dù đã tạo file JSON để kiểm tra, vẫn phải in JSON đầy đủ ngay trong chat; tiện ích không đọc link tải file.",
+    "Giữ đầy đủ HTML, nguồn, id và language; JSON-escape đúng dấu nháy/xuống dòng. Không chia block, không rút gọn nội dung/BASE64, không chèn dấu ... hay bịa bytes ảnh để đủ định dạng.",
+    "Yêu cầu đối với ảnh trong payload cuối gửi API: Ảnh Cẩm nang phải là file PNG/JPEG/WebP thật đã mã hoá BASE64 đầy đủ, không URL tạm/placeholder.",
+    "File ẢNH thật từ công cụ tạo ảnh vẫn được phép đính kèm. Chỉ dùng handbook-image:N khi tiện ích đã xác nhận và chỉ định các file ảnh thật đó; tiện ích sẽ thay bằng BASE64 thật trước gửi API. Không tự tạo mã ảnh khi chưa được chỉ định.",
+    "Nếu chưa thể xuất đầy đủ hoặc chưa có ảnh thật, báo rõ chưa hoàn tất, không báo thành công giả. Khi hoàn tất: CHỈ MỘT BLOCK ```json CHỨA TOÀN BỘ JSON NGAY TRONG CHAT."
+  ].join("\n");
+}
+
+function handbookPromptWithInlineJson(prompt) {
+  const rules = handbookInlineJsonRules();
+  return [rules, String(prompt ?? ""), rules].join("\n\n");
+}
+
+function handbookJsonAfterImagesPrompt(article, count) {
+  return handbookPromptWithInlineJson([
+    `Đã nhận ${count} file minh hoạ do công cụ tạo cho bài Cẩm nang id ${article.handbook_id}, language ${article.language}.`,
+    "Hãy trả TOÀN BỘ JSON cuối cùng theo đúng schema trong yêu cầu trước, giữ nội dung đầy đủ. Không bịa BASE64 và không tạo lại ảnh.",
+    `Trong content_html dùng chính xác src="handbook-image:1" đến src="handbook-image:${count}" theo thứ tự các file vừa được xác nhận; đây là các mã tiện ích đã chỉ định và sẽ thay bằng bytes ảnh thật trước gửi API.`,
+    "Không trả file JSON, link tải hay tóm tắt hoàn thành. Chỉ in đầy đủ JSON trong một block code json ngay trong chat; không token hoặc revision."
+  ].join("\n"));
+}
+
 function jsonFormatRetryPrompt(expectedId) {
   const expected = expectedId?.sourceType === "translation"
     ? expectedId.source_id
-    : ["toplist", "doctor", "facility_image_fix"].includes(expectedId?.sourceType) ? expectedId.id : expectedId;
+    : ["toplist", "doctor", "facility_image_fix", "handbook"].includes(expectedId?.sourceType) ? expectedId.id : expectedId;
   const identity = expected == null ? "đúng bài đang xử lý" : `bài có ID ${expected}`;
-  return [
+  const prompt = [
     "Yêu cầu bổ sung: Phản hồi vừa rồi chưa có JSON hợp lệ trong một khối code JSON.",
     `Hãy gửi lại TOÀN BỘ JSON cuối cùng của ${identity}, giữ nguyên đầy đủ tất cả trường và giá trị đã tạo; không rút gọn, không thêm/bớt dữ liệu${expected == null ? "." : `; trường ID phải khớp ${expected}.`}`,
     ...(expectedId?.sourceType === "doctor" ? [`Giữ id là số nguyên JSON dương và name chính xác là ${JSON.stringify(expectedId.name)}; không thay tên bác sĩ, không thêm khóa bảo mật.`] : []),
     ...(expectedId?.sourceType === "facility_image_fix" ? [`Giữ id là số nguyên JSON dương và images_revision chính xác là ${JSON.stringify(expectedId.images_revision)}; không thay revision, không tạo ảnh AI và không thêm khóa bảo mật.`] : []),
+    ...(expectedId?.sourceType === "handbook" ? [`Giữ language chính xác là ${JSON.stringify(expectedId.language)}. Không gửi lại link tải/file JSON; in toàn bộ JSON trong block code ngay trong chat, kể cả khi đã tạo file JSON ở phản hồi trước.`] : []),
     "Chỉ xuất đúng một khối Markdown bắt đầu bằng ```json và kết thúc bằng ```; không viết giải thích ở ngoài khối.",
     "Đảm bảo nội dung bên trong là JSON hợp lệ, mọi dấu ngoặc kép trong chuỗi đều được escape đúng chuẩn JSON."
   ].join("\n");
+  return expectedId?.sourceType === "handbook" ? handbookPromptWithInlineJson(prompt) : prompt;
 }
 
 async function requestJsonFormatRetry(articleId, expectedId, runToken, snapshot, promptOverride = null) {
-  const input = await waitForInput();
+  if (expectedId?.sourceType === "handbook") await waitForHandbookIdle(articleId, runToken);
+  let input = await waitForInput();
   const prompt = promptOverride || jsonFormatRetryPrompt(expectedId);
   setInputValue(input, prompt);
   if (PROVIDER === "chatgpt") {
@@ -902,6 +932,7 @@ async function requestJsonFormatRetry(articleId, expectedId, runToken, snapshot,
   } else if (!isGeminiSparkPage()) {
     await delay(250);
   }
+  if (expectedId?.sourceType === "handbook") input = await waitForHandbookIdle(articleId, runToken, input);
   if (!await submitPrompt(input)) throw new Error("Không tìm thấy nút Gửi cho yêu cầu định dạng lại JSON.");
   return saveJsonFormatRetryState(articleId, runToken, snapshot);
 }
@@ -967,7 +998,10 @@ function promptForProvider(prompt, article = null) {
   // translated} response envelope or drops the source record context.
   // Doctor prompts already contain the complete server-controlled research
   // schema and JSON-block contract. Keep them verbatim on every provider.
-  if (translation || article?.sourceType === "doctor" || article?.sourceType === "handbook") return value;
+  if (translation || article?.sourceType === "doctor") return value;
+  // Repeat this locally too: cached server prompts may predate the inline-only
+  // contract, and a downloadable JSON file is not an answer the parser can read.
+  if (article?.sourceType === "handbook") return handbookPromptWithInlineJson(value);
   const pieces = [value];
   if (!needsFencedJsonContract()) return pieces.filter(Boolean).join("\n");
   // Grok and Spark render unfenced JSON as Markdown. Quotes inside HTML/text
@@ -1706,8 +1740,7 @@ async function waitForPromptInComposer(element, prompt, timeoutMs = 20000) {
   return inputContainsPrompt(element, prompt);
 }
 
-function clickSend(input) {
-  if (PROVIDER === "chatgpt") {
+function findChatGPTSendButton(input) {
     const composer = input?.closest?.("[data-composer-footer-responsive]")
       || input?.closest?.("form")
       || input?.closest?.("[data-composer-body]")
@@ -1722,6 +1755,12 @@ function clickSend(input) {
           || /^(send-button|send-message)$/.test(testId)
           || (button.type === "submit" && /^(?:gửi|send)(?:\s|$)/i.test(buttonText)));
     });
+    return send || null;
+}
+
+function clickSend(input) {
+  if (PROVIDER === "chatgpt") {
+    const send = findChatGPTSendButton(input);
     if (!send) return false;
     send.click();
     return true;
@@ -2338,10 +2377,18 @@ function isChatGPTToolActivityVisible() {
     .some((node) => isVisible(node)
       && /(?:đang tìm kiếm(?: trên web)?|searching (?:the )?web|đang duyệt web|browsing (?:the )?web|đang mở trang|opening (?:a )?page|đang đọc trang|reading (?:a )?page)/i
         .test(String(node.innerText || node.textContent || "").replace(/\s+/g, " ").trim()));
-  return activityStatus;
+  if (activityStatus) return true;
+  // Image generation/thinking may temporarily replace Stop with a compact
+  // progress row. Only UI status controls count, never ordinary article text.
+  return [...document.querySelectorAll("main [role='status'], main [aria-live], main [role='progressbar'], main [data-testid*='progress'], main [data-testid*='image-generation'], main button")]
+    .some((node) => {
+      const text = String(node.getAttribute?.("aria-label") || node.innerText || node.textContent || "").replace(/\s+/g, " ").trim();
+      return isVisible(node) && (node.children?.length || 0) <= 2 && text.length <= 300
+        && /^(?:đang (?:tạo(?: hình)? ảnh|suy nghĩ|xử lý)|creating (?:an? )?image|generating (?:an? )?image|thinking|processing)(?:\s|[.…:·-]|$)/i.test(text);
+    });
 }
 function isGenerating(responseNode = null) {
-  const stopControl = [...document.querySelectorAll("button[data-testid*='stop'], button[aria-label*='Stop'], button[aria-label*='Dừng']")].some(isVisible);
+  const stopControl = [...document.querySelectorAll("button[data-testid*='stop'], button[data-test-id*='stop'], button[aria-label*='Stop' i], button[aria-label*='Dừng' i], button[aria-label*='Ngừng' i]")].some(isVisible);
   const streamingResponse = document.querySelector("[data-is-streaming='true']");
   // Spark retains many old research turns (and their processing controls) in
   // the task DOM. Only statuses attached to the newest assistant turn can
@@ -2367,6 +2414,40 @@ function isGenerating(responseNode = null) {
   return stopControl || sparkBusyResponse || sparkProcessingStatus
     || (PROVIDER === "chatgpt" && isChatGPTToolActivityVisible())
     || Boolean(streamingResponse && isVisible(streamingResponse));
+}
+
+async function waitForHandbookIdle(articleId, runToken, input = null) {
+  const started = Date.now();
+  const deadline = Date.now() + ARTICLE_WAIT_TIMEOUT_MS;
+  const sparkPage = isGeminiSparkPage();
+  let progressAt = started;
+  let idleSince = null;
+  let reported = false;
+  while (Date.now() < deadline) {
+    if (cancelledArticleId === articleId) throw new Error("Đã dừng bài viết.");
+    if (input?.isConnected === false) input = await waitForInput();
+    const busy = sparkPage ? isGeminiSparkStopVisible() : isGenerating();
+    if (sparkPage && runToken && Date.now() - progressAt >= 15000) {
+      progressAt = Date.now();
+      chrome.runtime.sendMessage({ type: "article-progress", articleId, runToken, progressAt: new Date(progressAt).toISOString() }).catch(() => {});
+    }
+    if (sparkPage && busy && Date.now() - Math.max(started, geminiSparkLastReloadAt(articleId)) >= GEMINI_SPARK_RELOAD_INTERVAL_MS) {
+      if (await reloadGeminiSparkForStall(articleId, runToken)) throw geminiSparkReloadError();
+    }
+    const sendReady = !input || PROVIDER !== "chatgpt" || Boolean(findChatGPTSendButton(input));
+    if (busy || !sendReady) {
+      idleSince = null;
+      if (!reported) {
+        reportSystemPhase(articleId, runToken, "writing-images", "Đang đợi AI tạo ảnh xong và nút Gửi sẵn sàng; chưa gửi yêu cầu JSON.");
+        reported = true;
+      }
+    } else {
+      idleSince ??= Date.now();
+      if (Date.now() - idleSince >= 3200) return input;
+    }
+    await delay(800);
+  }
+  throw new Error("Hết thời gian chờ AI hoàn tất tạo ảnh; chưa gửi yêu cầu JSON hay dữ liệu lên website.");
 }
 
 function geminiSparkProgressSignature(responseSignature = "", responseNode = null) {
@@ -2411,19 +2492,32 @@ async function waitForResponse(previous, articleId, timeout = ARTICLE_WAIT_TIMEO
   const sparkReloadReferenceAt = options.acceptCurrent ? (geminiSparkLastReloadAt(articleId) || started) : started;
   let sparkStopSeen = false;
   const imagePrevious = options.imagePrevious || null;
+  const handbookTurn = expectedId?.sourceType === "handbook";
   let imageLast = imagePrevious?.signature || "";
   let imageChangedAt = Date.now();
   while (options.waitUntilJson || Date.now() - started < timeout) {
     if (cancelledArticleId === articleId) throw new Error("Đã dừng bài viết.");
     await delay(sparkPage ? 1000 : 800);
     if (cancelledArticleId === articleId) throw new Error("Đã dừng bài viết.");
+    // While handbook tools own the turn, observe only generation controls.
+    // Reset stability on EVERY busy poll, including a long unchanged caption,
+    // so one transient missing Stop never triggers a formatting follow-up.
+    if (handbookTurn && !sparkPage && isGenerating()) {
+      changedAt = Date.now();
+      imageChangedAt = Date.now();
+      parsedChangedAt = Date.now();
+      continue;
+    }
     if (imagePrevious) {
       const currentImages = latestGeneratedImages();
-      if (currentImages.signature !== imageLast) {
-        imageLast = currentImages.signature;
+      const freshImages = currentImages.images.filter((image) => !imagePrevious.keys.has(image.key));
+      const ready = (entry) => entry.image?.complete !== false && entry.image?.naturalWidth > 0 && entry.image?.naturalHeight > 0;
+      const imageSignature = handbookTurn ? currentImages.signature + '|' + freshImages.map(entry => `${ready(entry)}:${entry.image?.naturalWidth}:${entry.image?.naturalHeight}`).join('|') : currentImages.signature;
+      if (imageSignature !== imageLast) {
+        imageLast = imageSignature;
         imageChangedAt = Date.now();
       }
-      const freshImage = currentImages.images.filter((image) => !imagePrevious.keys.has(image.key)).at(-1);
+      const freshImage = (!handbookTurn || freshImages.every(ready)) ? freshImages.at(-1) : null;
       if (freshImage) {
         const imageRawResponse = freshImage.rawResponse || rawResponse;
         // A direct image may arrive without a JSON planning response. Wait
@@ -2489,6 +2583,7 @@ async function waitForResponse(previous, articleId, timeout = ARTICLE_WAIT_TIMEO
       : identityChanged || options.acceptCurrent || (["grok", "claude", "gemini"].includes(PROVIDER) && contentChanged)
         || (sparkPage && !sparkGenerating);
     const generating = sparkPage ? sparkGenerating : isGenerating(now.node);
+    if (generating) { changedAt = Date.now(); parsedChangedAt = Date.now(); }
     if (sparkPage && !generating && Date.now() - changedAt >= 3200 && (!now.sources.length || !candidateAvailable)) {
       const error = new Error("Gemini Spark đã dừng nhưng chưa tìm thấy câu trả lời cho bài đang xử lý.");
       error.code = "gemini-spark-invalid-json";

@@ -74,6 +74,23 @@ test("ChatGPT Search controls count as active generation until the search finish
   assert.equal(api.isGenerating(), false, "once active controls/status disappear, the turn can be treated as complete");
 });
 
+test("ChatGPT image/thinking progress remains busy when Stop briefly disappears", () => {
+  const status = { textContent: "Đang tạo ảnh", getClientRects: () => [{}], children: [] };
+  const options = { processingStatuses: [status] };
+  const { api } = loadChatGPTContent(composer(), null, options);
+  for (const text of ["Đang tạo ảnh", "Creating image…", "Generating an image", "Đang suy nghĩ", "Thinking…"]) {
+    status.textContent = text;
+    assert.equal(api.isGenerating(), true, text);
+  }
+  status.hidden = true;
+  assert.equal(api.isGenerating(), false, "hidden progress from an old turn must not block");
+  status.hidden = false;
+  status.textContent = "Bài viết giải thích cách tạo ảnh minh hoạ";
+  assert.equal(api.isGenerating(), false, "ordinary explanatory text is not a busy signal");
+  options.processingStatuses = [];
+  assert.equal(api.isGenerating(), false);
+});
+
 test("ChatGPT article jobs find the current contenteditable composer without querying the plus button", async () => {
   const input = composer();
   const { api, selectorQueries } = loadChatGPTContent(input);
