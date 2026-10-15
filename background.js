@@ -5,6 +5,8 @@ const DEFAULTS = {
   doctorsUrl: "https://medreview.vn/api/medical/doctors-needing-content.php?page=1&limit=25",
   doctorUpdateUrl: "https://medreview.vn/api/medical/doctor-content-update.php",
   doctorContentUrl: "https://medreview.vn/api/medical/doctor-content.php",
+  handbooksUrl: "https://medreview.vn/api/medical/handbooks-needing-content.php?limit=10&language=vi",
+  handbookUpdateUrl: "https://medreview.vn/api/medical/handbook-content-update.php",
   facilityImageFixUrl: "https://medreview.vn/api/medical/facilities-needing-image-fix.php?limit=10",
   facilityImageFixUpdateUrl: "https://medreview.vn/api/medical/facility-image-fix-update.php",
   toplistsUrl: "https://medreview.vn/api/medical/toplists-needing-members.php?page=1&limit=1",
@@ -21,7 +23,7 @@ const DEFAULTS = {
   items: []
 };
 const API_URL_KEYS = [
-  "facilitiesUrl", "updateUrl", "doctorsUrl", "doctorUpdateUrl", "doctorContentUrl", "facilityImageFixUrl", "facilityImageFixUpdateUrl", "toplistsUrl", "toplistUpdateUrl", "aiImagesUrl", "aiImageUpdateUrl", "writerClaimUrl", "translationUrl"
+  "facilitiesUrl", "updateUrl", "doctorsUrl", "doctorUpdateUrl", "doctorContentUrl", "handbooksUrl", "handbookUpdateUrl", "facilityImageFixUrl", "facilityImageFixUpdateUrl", "toplistsUrl", "toplistUpdateUrl", "aiImagesUrl", "aiImageUpdateUrl", "writerClaimUrl", "translationUrl"
 ];
 // Kept in the background worker so normal page scripts never receive it.
 // It is passed only to this extension's isolated content script immediately
@@ -30,6 +32,7 @@ const API_URL_KEYS = [
 // never falls back to a credential embedded in the distributed source.
 try { if (typeof importScripts === "function") importScripts("api-key.local.js"); } catch {}
 const MEDICAL_API_KEY = String(globalThis.MEDREVIEW_MEDICAL_API_KEY || "");
+try { if (typeof importScripts === "function") importScripts("handbook.js"); } catch {}
 // Spark conversation IDs are account/session specific.  The content script
 // resolves this visible task label to the current account's conversation ID.
 const GEMINI_SPARK_CONTENT_TASK_LABEL = "content ai";
@@ -160,9 +163,9 @@ async function getTabSettings(tabId, keys) {
   for (const key of wanted) if (API_URL_KEYS.includes(key)) settings[key] = migrateApiSetting(key, settings[key]);
   return settings;
 }
-const SYSTEM_PHASES = new Set(["preparing", "connecting", "claiming", "finding-input", "filling", "waiting-send", "sending", "waiting-ai", "reading-json", "validating-json", "saving-json", "recovering", "retrying"]);
+const SYSTEM_PHASES = new Set(["preparing", "connecting", "claiming", "finding-input", "filling", "waiting-send", "sending", "waiting-ai", "writing-images", "attaching-images", "reading-json", "validating-json", "saving-json", "recovering", "retrying"]);
 
-const SOURCE_TYPES = new Set(["facility", "doctor", "facility_image_fix", "toplist", "ai-image", "translation"]);
+const SOURCE_TYPES = new Set(["facility", "doctor", "handbook", "facility_image_fix", "toplist", "ai-image", "translation"]);
 const TRANSLATION_TYPES = new Set(["facility", "doctor", "toplist"]);
 // Image generation is intentionally kept narrower than text generation. The
 // ChatGPT and Grok integrations have a reliable two-step image flow; Claude
@@ -190,6 +193,7 @@ function normalizeSourceType(value, fallback = "facility") {
 }
 
 function sourceLabel(sourceType) {
+  if (sourceType === "handbook") return "bài Cẩm nang";
   if (sourceType === "facility_image_fix") return "Fix ảnh cơ sở y tế";
   if (sourceType === "doctor") return "hồ sơ bác sĩ";
   if (sourceType === "toplist") return "Toplist";
@@ -296,6 +300,11 @@ async function initializeExtensionStorage() {
     // service-worker startup migration was waiting for the persistent profile
     // ID. Never write an older startup snapshot over a live queue/lease.
     const latest = await jobStorage.get(Object.keys(DEFAULTS));
+    if (Array.isArray(latest.items)) {
+      latest.items = latest.items.map((item) => isLegacyInsufficientReplacementFailure(item)
+        ? { ...item, image_fix_requires_research: false, image_fix_reclaim_allowed: true, image_fix_error_code: null, api_error_code: null }
+        : item);
+    }
     const migrated = Object.fromEntries(API_URL_KEYS
       .filter((key) => Object.hasOwn(latest, key))
       .map((key) => [key, migrateApiSetting(key, latest[key])])
@@ -528,6 +537,10 @@ async function getArticleContent(articleId, ownerTabId = null) {
   if (!metadata) return { ok: false, error: "Bài không còn trong tiện ích." };
   if (ownerTabId && itemOwnerTabId(metadata) && itemOwnerTabId(metadata) !== ownerTabId) return { ok: false, error: "Bài này thuộc bộ nhớ của tab khác." };
   const item = await hydrateArticle(metadata);
+  if (isHandbookItem(item) && item.handbook_payload_saved) {
+    const saved = await MedReviewHandbook.store.get(item.id);
+    if (saved?.result) return { ok: true, content: { prompt: item.prompt, result: saved.result } };
+  }
   return { ok: true, content: Object.fromEntries(ARTICLE_CONTENT_FIELDS.filter((field) => field !== "image_fix_payload" && Object.hasOwn(item, field)).map((field) => [field, item[field]])) };
 }
 
@@ -700,6 +713,7 @@ async function ensureWriterInstanceId(preferred = "") {
 }
 
 function writerClaimType(item) {
+  if (item?.sourceType === "handbook") return "handbook";
   // The current supported article writer queue is facilities. Keep the type
   // resolver generic for a future doctor-content queue, without routing any
   // doctor result through facility-content-update.php.
@@ -712,6 +726,7 @@ function writerClaimType(item) {
 }
 
 function writerClaimRecordId(item, type = writerClaimType(item)) {
+  if (type === "handbook") return item.handbook_id;
   if (type === "doctor") return item?.doctor_id ?? item?.source_id ?? item?.id;
   if (type === "facility") return item?.facility_id ?? item?.source_id ?? item?.id;
   return null;
@@ -838,12 +853,13 @@ async function performWriterClaimRequest(action, item, options = {}) {
   const type = options.type || writerClaimType(item);
   const id = options.id ?? writerClaimRecordId(item, type);
   if (!type || !id) throw new Error("Thiếu loại hoặc ID hợp lệ để khóa bài viết.");
-  const settings = await getTabSettings(itemOwnerTabId(item), "writerClaimUrl");
-  const url = migrateApiHost(settings.writerClaimUrl || DEFAULTS.writerClaimUrl);
+  const settings = await getTabSettings(itemOwnerTabId(item), type === "handbook" ? "handbooksUrl" : "writerClaimUrl");
+  const url = migrateApiHost(type === "handbook" ? settings.handbooksUrl || DEFAULTS.handbooksUrl : settings.writerClaimUrl || DEFAULTS.writerClaimUrl);
   const body = { action, type, id };
   if (action === "claim") {
     body.request_id = options.requestId;
     body.client = options.client;
+    if (type === "handbook") body.source_revision = item.source_revision;
   } else {
     body.claim_token = options.claimToken;
     if (action === "heartbeat" && isFacilityImageFixItem(item)) body.task = "facility_image_fix";
@@ -886,7 +902,7 @@ async function performWriterClaimRequest(action, item, options = {}) {
     error.retryableWriterClaim = response.status >= 500 && response.status !== 503;
     throw error;
   }
-  const conflict = action === "claim" && (response.status === 409 || data?.reason === "already_claimed" || (data?.ok === true && data?.claimed === false));
+  const conflict = action === "claim" && ((response.status === 409 && (type !== "handbook" || data?.reason === "already_claimed")) || data?.reason === "already_claimed" || (data?.ok === true && data?.claimed === false));
   if (conflict) {
     return { ok: true, claimed: false, reason: data?.reason || "already_claimed", writer: writerMetadata(data), response: data };
   }
@@ -903,6 +919,7 @@ async function performWriterClaimRequest(action, item, options = {}) {
     const detail = data?.message || data?.error || responseText.slice(0, 300) || "phản hồi không thành công";
     const error = new Error(`API khóa bài trả về HTTP ${response.status}: ${detail}`);
     error.httpStatus = response.status;
+    error.reason = data?.reason;
     error.retryableWriterClaim = response.status >= 500 && response.status !== 503;
     throw error;
   }
@@ -943,7 +960,7 @@ async function claimWriterLease(item, { provider, workerKey, runToken, tab, retr
     const current = items.find((entry) => String(entry.id) === String(item.id));
     if (!current) throw new Error("Không còn bài trong hàng đợi để khóa.");
     current.writer_claim_request_id = requestId;
-    if (isDoctorItem(current) || isFacilityImageFixItem(current)) current.writer_claim_worker_id = String(workerKey || current.workerKey || `tab-${itemOwnerTabId(current)}`);
+    if (isDoctorItem(current) || isFacilityImageFixItem(current) || isHandbookItem(current)) current.writer_claim_worker_id = String(workerKey || current.workerKey || `tab-${itemOwnerTabId(current)}`);
     current.writer_claim_required = true;
     current.writer_claim_type = type;
     current.writer_claim_id = writerClaimRecordId(current, type);
@@ -958,7 +975,7 @@ async function claimWriterLease(item, { provider, workerKey, runToken, tab, retr
     worker_id: String(workerKey || `tab-${tab?.id || "retry"}`),
     provider: String(provider || item.provider || "unknown"),
     model: String(item.model || item.model_name || item.modelId || "not-specified"),
-    task: isFacilityImageFixItem(item) ? "facility_image_fix" : type === "doctor" ? "doctor_article" : String(item.sparkTaskId || item.title || "article-writing").slice(0, 180)
+    task: type === "handbook" ? "handbook_article" : isFacilityImageFixItem(item) ? "facility_image_fix" : type === "doctor" ? "doctor_article" : String(item.sparkTaskId || item.title || "article-writing").slice(0, 180)
   };
   let result;
   for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -976,6 +993,7 @@ async function claimWriterLease(item, { provider, workerKey, runToken, tab, retr
   if (!result.claimed) return { claimed: false, required: true, writer: result.writer, reason: result.reason };
 
   const token = String(result.response.claim_token);
+  if (type === "handbook" && result.response.source_revision !== item.source_revision) throw new Error("Revision khóa Cẩm nang không khớp chủ đề; chưa gửi AI.");
   const expiry = writerLeaseExpiry(result.response);
   const saved = await withSchedulerLock(async () => {
     const { items = [], runner } = await jobStorage.get(["items", "runner"]);
@@ -1065,6 +1083,7 @@ async function renewActiveWriterClaims() {
   const toRelease = items.filter((item) => item.writer_claim_release_pending && item.writer_claim_token && !jobHasUnconfirmedSave(item));
   const claims = items.filter((item) => !item.writer_claim_release_pending && item.writer_claim_token && item.writer_claim_required &&
     (item.status === "đang viết" || isDoctorItem(item) && ["đang cập nhật", "chưa xác nhận"].includes(item.status) ||
+      isHandbookItem(item) && ["đang cập nhật", "chưa xác nhận", "lỗi cập nhật"].includes(item.status) ||
       isFacilityImageFixItem(item) && ["đang cập nhật", "chưa xác nhận", "lỗi cập nhật"].includes(item.status)) && !item.writer_claim_lost);
   let cursor = 0;
   const renew = async (metadata) => {
@@ -1122,6 +1141,23 @@ async function renewActiveWriterClaims() {
 }
 
 async function loseWriterClaim(articleId, claimToken, writer = {}) {
+  const handbook = (await getJobMetadata("items")).items?.find((row) => row.id === articleId && isHandbookItem(row));
+  if (handbook?.writer_claim_token === claimToken) {
+    // A save may have committed and released its lease before its reply. Keep
+    // the exact idempotent POST; never clear its private transport identity.
+    const pending = handbook.handbook_payload_saved || ["đang cập nhật", "chưa xác nhận"].includes(handbook.status);
+    await withSchedulerLock(async () => {
+      const { items = [] } = await getJobMetadata("items");
+      const current = items.find((row) => row.id === articleId);
+      if (!current || current.writer_claim_token !== claimToken) return;
+      current.writer_claim_lost = true;
+      current.status = pending ? "chưa xác nhận" : "lỗi";
+      current.api_error = pending ? "Chưa xác nhận lưu Cẩm nang; giữ nguyên request và payload để gửi lại kiểm tra biên nhận idempotent." : "Quyền giữ bài Cẩm nang đã mất; chưa gửi kết quả dưới khóa khác.";
+      await jobStorage.set({ items });
+    });
+    await pauseHandbookWorker(articleId, "Quyền giữ bài Cẩm nang đã mất; cần kiểm tra kết quả đã lưu.", pending ? "network_unconfirmed" : "lease_lost");
+    return { ok: true, paused: true };
+  }
   const stopped = await withSchedulerLock(async () => {
     const { items = [], runner } = await jobStorage.get(["items", "runner"]);
     const item = items.find((entry) => String(entry.id) === String(articleId));
@@ -1414,19 +1450,17 @@ function buildFacilityImageFixPayload(queueItem, result) {
   const proposedAi = result.ai_image_url === null ? "" : result.ai_image_url;
   if (typeof oldAi !== "string" || typeof proposedAi !== "string" || proposedAi !== oldAi && !(proposedAi === "" && inspected.get(oldAi) === "remove")) throw new Error("ai_image_url chỉ giữ nguyên hoặc xóa khi ảnh AI nguồn được remove.");
   if (typeof result.insufficient_images !== "boolean") throw new Error("insufficient_images phải là boolean.");
-  const aiUrls = new Set([oldAi, ...queueItem.images.filter((image) => image.fields?.includes("ai_image_url")).map((image) => image.url)].filter(Boolean));
-  const removedCount = [...inspected.values()].filter((decision) => decision === "remove").length;
-  const keptCount = result.inspected_images.filter((review) => imageFixReviewIsVerifiedKeep(review) && !aiUrls.has(review.url)).length;
-  const verifiedCount = keptCount + added.size;
-  if (removedCount > 0 && verifiedCount < 5) {
-    const error = new Error(`Chưa cập nhật xóa ảnh: đã loại ${removedCount} ảnh nhưng chỉ có ${verifiedCount}/5 ảnh thật đã xác minh (${keptCount} keep + ${added.size} mới). uncertain và ảnh AI không tính; cần tìm thêm ${5 - verifiedCount} ảnh thay thế rồi kiểm tra AI lại.`);
-    error.imageFixErrorCode = "insufficient_replacement_images";
-    throw error;
-  }
   const notes = normalizeFacilityImageFixNotes(result.notes);
   const payload = { items: [{ ...result, notes, ai_image_url: proposedAi, writer_claim_token: queueItem.writer_claim_token }] };
   if (unescape(encodeURIComponent(JSON.stringify(payload))).length > 2 * 1024 * 1024) throw new Error("JSON Fix ảnh vượt giới hạn 2MB.");
   return payload;
+}
+function isLegacyInsufficientReplacementFailure(item) {
+  if (!isFacilityImageFixItem(item)) return false;
+  const code = String(item.image_fix_error_code || item.api_error_code || "").toLowerCase();
+  const message = String(item.api_error || item.error || "");
+  return Boolean(item.image_fix_reclaim_allowed || code === "insufficient_replacement_images" ||
+    /Chưa cập nhật xóa ảnh:.*\/5 ảnh thật đã xác minh/i.test(message));
 }
 function imageFixApiError(status, data, text) {
   const own = data?.errors?.find((entry) => entry.index === 0) || data?.errors?.[0];
@@ -1517,7 +1551,7 @@ async function publishFacilityImageFix(articleId, queueItem, result) {
     const importState = data ? imageFixImportState(data, queueItem.facility_id) : null;
     const partial = importState?.partial === true;
     const status = data ? partial ? "ảnh chưa đủ" : "hoàn tất" : ineligible ? "bỏ qua" : failure.imageFixUnconfirmed ? "chưa xác nhận" : "lỗi cập nhật";
-    const research = ["images_changed", "lease_lost", "insufficient_replacement_images"].includes(failure?.imageFixErrorCode) ||
+    const research = ["images_changed", "lease_lost"].includes(failure?.imageFixErrorCode) ||
       !failure?.imageFixUnconfirmed && [401, 403, 404, 503].includes(failure?.httpStatus);
     await withSchedulerLock(async () => {
       const { items = [] } = await getJobMetadata("items");
@@ -1529,6 +1563,7 @@ async function publishFacilityImageFix(articleId, queueItem, result) {
       current.image_fix_requires_research = research;
       current.image_fix_error_code = current.api_error_code = failure?.imageFixErrorCode || null;
       if (data) {
+        delete current.image_fix_reclaim_allowed;
         clearWriterClaimFields(current);
         current.writer_claimed = false;
         // A partial import has committed JSON and released its lease already.
@@ -1553,6 +1588,31 @@ async function retryFacilityImageFixUpdate(articleId) {
   if (!isFacilityImageFixItem(item) || !item.result) throw new Error("Không có JSON Fix ảnh để gửi lại.");
   if (item.status === "hoàn tất") return { ok: true, updated: true, already_processed: true };
   if (activeApiRequests.has(String(articleId))) throw new Error("API Fix ảnh vẫn đang gửi; chưa gửi trùng.");
+  if (!hasFacilityImageFixReceipt(item) && !item.writer_claim_token && isLegacyInsufficientReplacementFailure(item)) {
+    await withSchedulerLock(async () => {
+      const { items: latest = [] } = await getJobMetadata("items");
+      const current = latest.find((row) => row.id === articleId);
+      if (!current) return;
+      delete current.writer_claim_request_id;
+      delete current.writer_claim_lost;
+      current.image_fix_requires_research = false;
+      current.image_fix_error_code = current.api_error_code = null;
+      await jobStorage.set({ items: latest });
+    });
+    delete item.writer_claim_request_id;
+    delete item.writer_claim_lost;
+    const lease = await claimWriterLease(item, {
+      provider: item.provider || "manual-retry",
+      workerKey: item.writer_claim_worker_id || item.workerKey || `tab-${itemOwnerTabId(item)}`,
+      retry: true
+    });
+    if (!lease.claimed) throw new Error(`Không thể nhận lại khóa cơ sở để gửi lại: ${lease.reason || "đang được máy khác giữ"}.`);
+    const refreshed = (await jobStorage.get("items")).items?.find((row) => row.id === articleId);
+    if (refreshed) Object.assign(item, refreshed);
+    item.image_fix_requires_research = false;
+    item.image_fix_error_code = item.api_error_code = null;
+    delete item.image_fix_reclaim_allowed;
+  }
   if (!hasFacilityImageFixReceipt(item) && (item.image_fix_requires_research || item.writer_claim_lost || !item.writer_claim_token)) throw new Error("Ảnh nguồn/khóa đã thay đổi; cần kiểm tra AI lại, không gửi JSON cũ dưới khóa mới.");
   await withSchedulerLock(async () => {
     const { items: latest = [] } = await getJobMetadata("items");
@@ -1870,7 +1930,149 @@ async function refreshQueue(requestedSource, requestedTranslationType, ownerTabI
   });
 }
 
+function isHandbookItem(item) { return item?.sourceType === "handbook"; }
+
+async function fetchHandbooks(tabId) {
+  const settings = await getTabSettings(tabId, "handbooksUrl");
+  const url = new URL(migrateApiHost(settings.handbooksUrl || DEFAULTS.handbooksUrl));
+  return withQueueFetchTimeout(async (signal) => {
+    const response = await fetch(url.href, { signal, cache: "no-store", headers: { "X-Medical-Api-Key": MEDICAL_API_KEY, Accept: "application/json" } });
+    let data;
+    try { data = JSON.parse(await response.text()); } catch { throw new Error(`API Cẩm nang HTTP ${response.status}: phản hồi không phải JSON.`); }
+    if (!response.ok || data?.ok !== true || data.contract_version !== 1 || !Array.isArray(data.items)) {
+      throw new Error(`API Cẩm nang HTTP ${response.status}: ${data?.message || "hợp đồng không hợp lệ"}`);
+    }
+    for (const key of ["claim_endpoint", "receive_endpoint"]) {
+      const endpoint = new URL(data[key], url);
+      if (!data[key] || endpoint.origin !== url.origin) throw new Error(`API Cẩm nang ${key} không cùng website; chưa chuyển khóa API.`);
+    }
+    return { ...data, items: data.items.map((item) => ({ ...item, contract_version: 1 })) };
+  }, "Cẩm nang");
+}
+
+async function pauseHandbookWorker(articleId, message, code) {
+  await withSchedulerLock(async () => {
+    const { items = [], runner } = await getJobMetadata(["items", "runner"]);
+    const item = items.find((entry) => entry.id === articleId);
+    if (item) item.handbook_error_code = code || "handbook_error";
+    const worker = runner?.workers?.[item?.workerKey] || (!runner?.workers ? runner : null);
+    if (worker) { worker.active = false; worker.lastError = message; worker.waitReason = "handbook-error"; delete worker.nextJobAt; }
+    if (runner) refreshRunnerSummary(runner, items);
+    await jobStorage.set({ items, ...(runner ? { runner } : {}) });
+  });
+}
+
+async function stageHandbookResult(message, sender, result) {
+  return withSchedulerLock(async () => {
+    const { items = [], runner } = await getJobMetadata(["items", "runner"]);
+    const workerKey = currentJobKeyFromState(runner, items, message.articleId, message.runToken, sender, { allowExpiredLease: true });
+    const item = items.find((row) => row.id === message.articleId);
+    if (!workerKey || !isHandbookItem(item)) return null;
+    // Save original output even when validation fails. Never put BASE64 in the
+    // small queue, storage.sync, system notices, or raw-response logs.
+    await MedReviewHandbook.store.put(item.id, { result });
+    item.handbook_payload_saved = true;
+    item.has_result = true;
+    delete item.rawResponse;
+    delete item.handbook_error_code;
+    try {
+      const payload = MedReviewHandbook.payload(item, result);
+      await MedReviewHandbook.store.put(item.id, { result, payload });
+      markApiRequestStarted(item);
+    } catch (error) {
+      item.status = "lỗi cập nhật";
+      item.api_error = MedReviewHandbook.safeError(error);
+      item.handbook_error_code = error.code || "invalid_payload";
+    }
+    await jobStorage.set({ items });
+    return { workerKey, queueItem: { ...item } };
+  });
+}
+
+async function publishHandbook(item) {
+  const key = String(item.id);
+  if (activeApiRequests.has(key)) return { ok: false, updated: false, error: "Cẩm nang đang gửi, chưa gửi trùng." };
+  activeApiRequests.add(key);
+  let responseData, failure;
+  try {
+    const saved = await MedReviewHandbook.store.get(item.id);
+    if (!saved?.payload) throw MedReviewHandbook.error("invalid_payload", "Chưa có HTML và ảnh Cẩm nang hợp lệ để gửi; JSON gốc vẫn được giữ.");
+    const settings = await getTabSettings(itemOwnerTabId(item), "handbookUpdateUrl");
+    let response;
+    try {
+      response = await fetch(migrateApiHost(settings.handbookUpdateUrl || DEFAULTS.handbookUpdateUrl), {
+        method: "POST", headers: { "Content-Type": "application/json", "X-Medical-Api-Key": MEDICAL_API_KEY, Accept: "application/json" }, body: JSON.stringify(saved.payload)
+      });
+    } catch { throw MedReviewHandbook.error("network_unconfirmed", "Mất phản hồi gửi Cẩm nang; giữ nguyên payload, token, revision và request_id để gửi lại idempotent."); }
+    let data;
+    try { data = JSON.parse(await response.text()); } catch { throw MedReviewHandbook.error("response_unconfirmed", `API Cẩm nang HTTP ${response.status}: chưa xác nhận JSON phản hồi; giữ nguyên payload để kiểm tra/gửi lại.`); }
+    if (!response.ok || data?.ok !== true) {
+      const error = MedReviewHandbook.error(data?.reason || "api_error", `API Cẩm nang HTTP ${response.status}: ${MedReviewHandbook.safeError(data?.message || "chưa lưu được bài")}`);
+      error.httpStatus = response.status;
+      throw error;
+    }
+    if (data.type !== "handbook" || data.id !== Number(item.handbook_id) || data.status !== "draft" ||
+        !Array.isArray(data.images) || !data.images.length || data.images.length > 4 ||
+        data.images.some((image) => typeof image.url !== "string" || !image.url.startsWith("/uploads/handbook/") || image.url.includes(".."))) {
+      throw MedReviewHandbook.error("response_unconfirmed", "API chưa xác nhận đúng ID, trạng thái draft và URL ảnh nội bộ Cẩm nang; giữ nguyên payload.");
+    }
+    responseData = data;
+    await withSchedulerLock(async () => {
+      const { items = [] } = await getJobMetadata("items");
+      const current = items.find((row) => row.id === item.id);
+      if (!current) return;
+      current.result = MedReviewHandbook.compact(saved.result, data);
+      current.handbook_payload_saved = false;
+      delete current.handbook_error_code;
+      finalizeApiRequest(current, "hoàn tất", data, null);
+      clearWriterClaimFields(current);
+      await jobStorage.set({ items });
+    });
+    // Delete large bytes only AFTER the lightweight success is durable.
+    await MedReviewHandbook.store.remove(item.id);
+    return { ok: true, updated: true, status: "draft", images: data.images };
+  } catch (error) {
+    failure = error;
+    const message = MedReviewHandbook.safeError(error);
+    await withSchedulerLock(async () => {
+      const { items = [] } = await getJobMetadata("items");
+      const current = items.find((row) => row.id === item.id);
+      if (!current || current.status === "hoàn tất") return;
+      finalizeApiRequest(current, /unconfirmed/.test(error.code || "") || error.httpStatus >= 500 ? "chưa xác nhận" : "lỗi cập nhật", null, message);
+      current.handbook_error_code = error.code || "api_error";
+      await jobStorage.set({ items });
+    });
+    await pauseHandbookWorker(item.id, message, error.code);
+    return { ok: false, updated: false, error: message, code: error.code, unconfirmed: /unconfirmed/.test(error.code || "") };
+  } finally { activeApiRequests.delete(key); }
+}
+
+async function completeHandbook(message, sender, result) {
+  const staged = await stageHandbookResult(message, sender, result);
+  if (!staged) return { ok: false, ignored: true, error: "Kết quả Cẩm nang không thuộc đúng tab/lượt đang viết." };
+  if (staged.queueItem.handbook_error_code) {
+    await pauseHandbookWorker(message.articleId, staged.queueItem.api_error, staged.queueItem.handbook_error_code);
+    return { ok: true, updated: false, error: staged.queueItem.api_error };
+  }
+  const published = await publishHandbook(staged.queueItem);
+  if (published.updated) {
+    await clearCurrent(message.articleId, message.runToken, staged.workerKey === "legacy" ? undefined : staged.workerKey, { pauseBeforeNext: true });
+    const prepared = await waitBeforeNextJob(staged.workerKey === "legacy" ? undefined : staged.workerKey);
+    if (!prepared?.dispatched) await runNext(staged.workerKey === "legacy" ? undefined : staged.workerKey, !prepared?.attempted);
+  }
+  return { ...published, ok: true };
+}
+
+async function retryHandbook(item) {
+  if (item.status === "hoàn tất") throw new Error("Cẩm nang đã lưu nháp; không tự ghi đè.");
+  if (["already_claimed", "lease_lost", "not_eligible", "source_revision_changed", "idempotency_conflict"].includes(item.handbook_error_code)) {
+    throw new Error("Bài hoặc quyền giữ Cẩm nang đã thay đổi. JSON được giữ để đối chiếu; không nhận khóa khác để gửi đè.");
+  }
+  return publishHandbook(item);
+}
+
 async function fetchQueueSource(sourceType, translationType, tabId, { refill = false } = {}) {
+  if (sourceType === "handbook") return fetchHandbooks(tabId);
   if (sourceType === "facility_image_fix") {
     const state = refill ? (await jobStorage.get(imageFixQueueKey(tabId)))[imageFixQueueKey(tabId)] : null;
     if (state?.exhausted) return { ok: true, items: [], errors: state.errors || [], next_after_id: null, language: state.language };
@@ -2822,7 +3024,7 @@ function itemOwnerTabId(item) {
 function queueItemIdentityKey(item) {
   const sourceType = queueItemSource(item);
   if (sourceType === "translation") return `translation-${normalizeTranslationType(item.type || item.translation_type)}-${item.source_id}`;
-  const sourceId = sourceType === "toplist" ? item.toplist_id : sourceType === "doctor" ? item.doctor_id : item.facility_id;
+  const sourceId = sourceType === "handbook" ? item.handbook_id : sourceType === "toplist" ? item.toplist_id : sourceType === "doctor" ? item.doctor_id : item.facility_id;
   return sourceId == null ? String(item.id || "") : `${sourceType}-${sourceId}`;
 }
 
@@ -2922,6 +3124,7 @@ function isWorkerQueueItemRunnable(items, item, scope) {
 }
 
 function queueItemSource(item) {
+  if (isHandbookItem(item)) return "handbook";
   if (isFacilityImageFixItem(item)) return "facility_image_fix";
   if (isDoctorItem(item)) return "doctor";
   if (item?.sourceType === "translation") return "translation";
@@ -3088,6 +3291,7 @@ function mergeQueueItems(current, incoming, sourceType, translationType = "facil
     const entrySourceId = sourceType === "translation" ? entry?.source_id : entry?.id;
     if (entrySourceId == null || String(entrySourceId).trim() === "" || typeof entry.prompt !== "string" || !entry.prompt.trim()) { skipped += 1; continue; }
     if (sourceType === "doctor" && (!isPositiveId(entry.id) || !doctorQueueEligible(entry))) { skipped += 1; continue; }
+    if (sourceType === "handbook" && (!Number.isSafeInteger(entry.id) || entry.id <= 0 || !/^[a-f0-9]{64}$/.test(entry.source_revision || "") || !["vi", "en"].includes(entry.language) || entry.contract_version !== 1)) { skipped += 1; continue; }
     if (sourceType === "facility_image_fix" && (!isPositiveId(entry.id) || !validImageFixSource(entry))) { skipped += 1; continue; }
     if (sourceType === "translation") {
       try { translationAllowedFields(entry); }
@@ -3111,7 +3315,9 @@ function mergeQueueItems(current, incoming, sourceType, translationType = "facil
       if (!seenIncoming.has(id)) {
         if (sourceType === "translation") refreshQueuedTranslationData(previous, entry);
         else if (sourceType === "facility_image_fix" && previous.status === "chờ") copyImageFixSource(previous, entry);
-        else if (sourceType === "doctor" && previous.status === "chờ") {
+        else if (sourceType === "handbook" && previous.status === "chờ" && !previous.writer_claim_token) {
+          for (const key of ["prompt", "title", "language", "topic", "source_revision", "output_template", "contract_version"]) previous[key] = entry[key];
+        } else if (sourceType === "doctor" && previous.status === "chờ") {
           previous.prompt = entry.prompt;
           previous.output_template = entry.output_template;
           previous.name = entry.name;
@@ -3137,7 +3343,7 @@ function mergeQueueItems(current, incoming, sourceType, translationType = "facil
       sourceType,
       ...(sourceType === "translation"
         ? { type: perItemTranslationType, translation_type: perItemTranslationType, source_id: entrySourceId }
-        : sourceType === "toplist" ? { toplist_id: entry.id } : sourceType === "doctor" ? { doctor_id: Number(entry.id) } : { facility_id: entry.id }),
+        : sourceType === "handbook" ? { handbook_id: entry.id } : sourceType === "toplist" ? { toplist_id: entry.id } : sourceType === "doctor" ? { doctor_id: Number(entry.id) } : { facility_id: entry.id }),
       title: sourceType === "translation"
         ? entry.title || entry.name || entry.source?.name || entry.source?.title || `Bản dịch ${perItemTranslationType} #${entrySourceId}`
         : sourceType === "toplist" ? entry.title || entry.name || "Toplist" : entry.name || entry.title || (sourceType === "doctor" ? "Bác sĩ" : "Cơ sở y tế"),
@@ -3314,6 +3520,9 @@ function contentSafeArticle(article) {
     "writer_claim_type", "writer_claim_release_pending", "writer_claim_release_error",
     "writer_claim_heartbeat_error", "writer_claim_required", "doctor_writer_request_id", "doctor_heartbeat_halt", "writer_claim_worker_id", "claim_token", "ai_writer_claim_json", "full_json", "image_fix_payload", "image_fix_previous_result"
   ]) delete safe[key];
+  if (isHandbookItem(article)) {
+    for (const key of ["source_revision", "result", "rawResponse", "output_template", "receive_endpoint", "claim_endpoint"]) delete safe[key];
+  }
   return safe;
 }
 
@@ -3379,7 +3588,7 @@ async function startJob(article, prompt, workerKeyOrProvider, runToken) {
     if (!/Receiving end does not exist|Could not establish connection/i.test(String(error.message))) throw error;
   }
   if (!receiverReady && typeof chrome.scripting?.executeScript === "function") {
-    await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["content.js"] });
+    await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: isHandbookItem(article) ? ["handbook.js", "content.js"] : ["content.js"] });
   }
   startupTiming.receiverReadyMs = Date.now() - readyStartedAt;
   startupTiming.scriptInjected = !receiverReady;
@@ -3442,7 +3651,7 @@ async function startJob(article, prompt, workerKeyOrProvider, runToken) {
     if (workerMode && !await canDispatchWorkerJob(workerKeyOrProvider, article.id, runToken, tab.id, provider)) {
       throw workerReleasedError();
     }
-    await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["content.js"] });
+    await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: isHandbookItem(article) ? ["handbook.js", "content.js"] : ["content.js"] });
     if (workerMode && !await canDispatchWorkerJob(workerKeyOrProvider, article.id, runToken, tab.id, provider)) {
       throw workerReleasedError();
     }
@@ -3545,7 +3754,7 @@ async function finishJob(articleId, article, rawResponse) {
 }
 
 function currentJobKeyFromState(runner, items, articleId, runToken, sender = {}, { allowExpiredLease = false } = {}) {
-  const ownsLease = (item) => writerLeaseIsCurrent(item) || allowExpiredLease && isFacilityImageFixItem(item) &&
+  const ownsLease = (item) => writerLeaseIsCurrent(item) || allowExpiredLease && (isFacilityImageFixItem(item) || isHandbookItem(item)) &&
     item.writer_claim_required && item.writer_claim_token && !item.writer_claim_lost;
   if (!runner?.active) return null;
   if (runner.workers) {
@@ -3816,6 +4025,8 @@ async function isCurrentJob(articleId, runToken, senderTabId) {
 
 async function handleArticleComplete(message, sender = {}) {
   const completedResult = completionResult(message);
+  const metadata = (await getJobMetadata("items")).items?.find((item) => item.id === message.articleId);
+  if (isHandbookItem(metadata)) return completeHandbook(message, sender, completedResult);
   const haltedCompletion = await preserveHaltedDoctorCompletion(message, sender, completedResult);
   if (haltedCompletion) return haltedCompletion;
   let leaseValid;
@@ -3959,6 +4170,12 @@ async function handleDirectImageUploadComplete(message, sender = {}) {
 }
 
 async function handleArticleFailed(message, sender = {}) {
+  const handbook = (await getJobMetadata("items")).items?.find((item) => item.id === message.articleId && isHandbookItem(item));
+  if (handbook) {
+    const failed = await failJob(message.articleId, MedReviewHandbook.safeError(message.error), null, { runToken: message.runToken, sender });
+    if (!failed.ignored) await pauseHandbookWorker(message.articleId, MedReviewHandbook.safeError(message.error), message.errorCode || "missing_images");
+    return { ok: true, updated: false };
+  }
   if (!await validateWriterLeaseForCompletion(message.articleId)) {
     return { ok: false, ignored: true, error: "Khóa bài đã mất hoặc hết hạn; phản hồi lỗi cũ đã được bỏ qua." };
   }
@@ -4625,6 +4842,7 @@ function buildUpdatePayload(queueItem, aiResult) {
 
 async function retryUpdate(articleId) {
   const snapshot = (await getJobMetadata("items")).items?.find((item) => item.id === articleId);
+  if (isHandbookItem(snapshot)) return retryHandbook(snapshot);
   if (isFacilityImageFixItem(snapshot)) return retryFacilityImageFixUpdate(articleId);
   await reconcileStaleApiUpdates();
   const { items: before = [] } = await jobStorage.get("items");
@@ -4750,7 +4968,11 @@ async function failJob(articleId, error, rawResponse, expectedJob = null) {
         item.failure_code = UNSUPPORTED_IMAGE_PROVIDER_FAILURE;
         item.failed_provider = item.provider;
       }
-      if (typeof rawResponse === "string") item.rawResponse = rawResponse;
+      if (isHandbookItem(item)) {
+        item.error = MedReviewHandbook.safeError(error);
+        item.handbook_error_code = /ảnh|BASE64|image/i.test(error) ? "missing_images" : "ai_response_error";
+        delete item.rawResponse;
+      } else if (typeof rawResponse === "string") item.rawResponse = rawResponse;
       await jobStorage.set({ items });
     }
     return { ok: true, workerKey, ...(item?.writer_claim_token ? { claimItem: { ...item } } : {}) };

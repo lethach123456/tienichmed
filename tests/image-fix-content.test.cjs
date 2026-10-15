@@ -292,10 +292,10 @@ function missingReplacementFixture() {
   return { source, output };
 }
 
-test("replacement minimum excludes uncertain, AI and duplicate added URLs", () => {
+test("replacement summary defaults to minimum 0 so removals do not require five verified images", () => {
   const api = loadContent();
   const { source, output } = missingReplacementFixture();
-  assert.deepEqual(plain(api.imageFixReplacementSummary(source, output)), { removed: 2, kept: 0, added: 0, verified: 0, minimum: 5 });
+  assert.deepEqual(plain(api.imageFixReplacementSummary(source, output)), { removed: 2, kept: 0, added: 0, verified: 0, minimum: 0 });
   source.ai_image_url = source.images[0].url;
   output.inspected_images[0].decision = "keep";
   output.inspected_images[1].decision = "keep";
@@ -303,9 +303,9 @@ test("replacement minimum excludes uncertain, AI and duplicate added URLs", () =
   output.inspected_images[1].evidence_url = "https://clinic.example/about";
   const newImage = { url: "https://clinic.example/new.jpg", source: "Website", source_url: "https://clinic.example/about" };
   output.added_images = [newImage, { ...newImage }, { ...newImage, url: source.images[1].url }];
-  assert.deepEqual(plain(api.imageFixReplacementSummary(source, output)), { removed: 2, kept: 1, added: 1, verified: 2, minimum: 5 });
+  assert.deepEqual(plain(api.imageFixReplacementSummary(source, output)), { removed: 2, kept: 1, added: 1, verified: 2, minimum: 0 });
   const prompt = api.imageFixReplacementPrompt({ ...source, writer_claim_token: "PRIVATE-TOKEN", apiKey: "PRIVATE-KEY" }, output,
-    api.imageFixReplacementSummary(source, output));
+    api.imageFixReplacementSummary({ ...source, minimum_verified_images: 5 }, output));
   assert.match(prompt, /bổ sung ít nhất 3/);
   assert.match(prompt, /uncertain.*KHÔNG tính/);
   assert.match(prompt, /TOÀN BỘ JSON/);
@@ -323,7 +323,7 @@ test("replacement counting tolerates malformed entries and does not count privat
   assert.equal(api.imageFixReplacementSummary(source, output).verified, 0);
 });
 
-test("blocked or unviewable keep labels cannot satisfy the replacement minimum", () => {
+test("blocked or unviewable keep labels are not counted as verified keeps in summary", () => {
   const api = loadContent();
   const { source, output } = missingReplacementFixture();
   for (const bad of [
@@ -343,12 +343,9 @@ test("blocked or unviewable keep labels cannot satisfy the replacement minimum",
   assert.equal(api.imageFixReplacementSummary(source, output).verified, 5);
 });
 
-test("replacement research starts only after provider completion and returns the full improved JSON", async () => {
+test("image-fix accepts valid JSON with removals and fewer than five verified images immediately without forcing a follow-up prompt", async () => {
   for (const hostname of ["grok.com", "chatgpt.com", "gemini.google.com"]) {
     const { source, output } = missingReplacementFixture();
-    const improved = { ...output, insufficient_images: false, added_images: Array.from({ length: 5 }, (_, i) => ({
-      url: `https://clinic.example/new-${i}.jpg`, source: "Website", source_url: "https://clinic.example/about"
-    })) };
     const state = { time: 0, active: true, retries: 0, reply: fenced(output), id: "original" };
     const stop = { getClientRects: () => [{}], getAttribute: () => null };
     const session = new Map();
@@ -362,27 +359,20 @@ test("replacement research starts only after provider completion and returns the
       chrome: { runtime: { onMessage: { addListener() {} }, sendMessage: async () => ({ ok: true }) } }
     });
     api.setResponseHandlers(() => ({ node: {}, id: state.id, count: 1, sources: [state.reply], signature: state.reply }),
-      async (_articleId, expected, _runToken, baseline, followup) => {
-        assert.equal(state.active, false, "never ask for replacement images while AI is still generating");
-        assert.ok(state.time >= 6400);
-        assert.match(followup, /bổ sung ít nhất 5/);
-        assert.ok(followup.includes(JSON.stringify(revision)));
-        state.retries += 1; state.id = "improved"; state.reply = fenced(improved);
-        return { id: baseline.id, count: baseline.count, signatureHash: api.responseSignatureHash(baseline.signature) };
-      });
+      async () => { throw new Error("must not force replacement follow-up when 5-image minimum is disabled"); });
     const parsed = await api.waitForResponse({ node: null, signature: "" }, source.id, 30000, api.expectedArticleId(source),
-      { imageFixArticle: source, runToken: "replacement-run" });
-    assert.deepEqual(plain(parsed.data), improved);
-    assert.equal(state.retries, 1);
-    assert.ok([...session.values()].includes("sent"), "remember replacement request across page reloads");
+      { imageFixArticle: source, runToken: "no-5-image-gate" });
+    assert.deepEqual(plain(parsed.data), output);
+    assert.equal(state.retries, 0);
   }
 });
 
-test("one insufficient replacement follow-up returns intact JSON for the background no-POST guard", async () => {
+test("optional minimum_verified_images still supports one replacement follow-up when explicitly configured", async () => {
   const { source, output } = missingReplacementFixture();
   const { api, state } = watcher("grok.com", fenced(output));
   state.reply = fenced(output);
-  const parsed = await api.waitForResponse({ node: null, signature: "" }, source.id, 30000, api.expectedArticleId(source), { imageFixArticle: source });
+  const parsed = await api.waitForResponse({ node: null, signature: "" }, source.id, 30000, api.expectedArticleId(source),
+    { imageFixArticle: { ...source, minimum_verified_images: 5 } });
   assert.equal(state.retries, 1);
   assert.deepEqual(plain(parsed.data), output);
 });
@@ -398,7 +388,7 @@ test("recovery does not send another replacement request already persisted for t
   api.setResponseHandlers(() => ({ node: {}, id: "done", count: 1, sources: [fenced(output)], signature: fenced(output) }),
     () => { throw new Error("must not send a duplicate replacement follow-up"); });
   const parsed = await api.waitForResponse({ node: null, signature: "" }, source.id, 30000, api.expectedArticleId(source),
-    { imageFixArticle: source, runToken: "same-run", acceptCurrent: true });
+    { imageFixArticle: { ...source, minimum_verified_images: 5 }, runToken: "same-run", acceptCurrent: true });
   assert.deepEqual(plain(parsed.data), output);
 });
 

@@ -25,8 +25,8 @@ function loadWorker(configPresent) {
 test("worker loads the installation-only private key without embedding a fallback credential", () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(root, "manifest.json"), "utf8"));
   assert.notEqual(manifest.background.type, "module", "importScripts requires a classic service worker");
-  assert.deepEqual(loadWorker(true), { key: "test-private-installation-key", imports: ["api-key.local.js"] });
-  assert.deepEqual(loadWorker(false), { key: "", imports: ["api-key.local.js"] });
+  assert.deepEqual(loadWorker(true), { key: "test-private-installation-key", imports: ["api-key.local.js", "handbook.js"] });
+  assert.deepEqual(loadWorker(false), { key: "", imports: ["api-key.local.js", "handbook.js"] });
   assert.doesNotMatch(source, /["']X-Medical-Api-Key["']\s*:\s*["'][^"']+["']/);
 });
 

@@ -11,6 +11,8 @@ const defaults = {
   doctorsUrl: "https://medreview.vn/api/medical/doctors-needing-content.php?page=1&limit=25",
   doctorUpdateUrl: "https://medreview.vn/api/medical/doctor-content-update.php",
   doctorContentUrl: "https://medreview.vn/api/medical/doctor-content.php",
+  handbooksUrl: "https://medreview.vn/api/medical/handbooks-needing-content.php?limit=10&language=vi",
+  handbookUpdateUrl: "https://medreview.vn/api/medical/handbook-content-update.php",
   facilityImageFixUrl: "https://medreview.vn/api/medical/facilities-needing-image-fix.php?limit=10",
   facilityImageFixUpdateUrl: "https://medreview.vn/api/medical/facility-image-fix-update.php",
   toplistsUrl: "https://medreview.vn/api/medical/toplists-needing-members.php?page=1&limit=1",

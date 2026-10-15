@@ -46,6 +46,8 @@ const API_SETTINGS = {
   doctorsUrl: "https://medreview.vn/api/medical/doctors-needing-content.php?page=1&limit=25",
   doctorUpdateUrl: "https://medreview.vn/api/medical/doctor-content-update.php",
   doctorContentUrl: "https://medreview.vn/api/medical/doctor-content.php",
+  handbooksUrl: "https://medreview.vn/api/medical/handbooks-needing-content.php?limit=10&language=vi",
+  handbookUpdateUrl: "https://medreview.vn/api/medical/handbook-content-update.php",
   toplistsUrl: "https://medreview.vn/api/medical/toplists-needing-members.php?page=1&limit=1",
   toplistUpdateUrl: "https://medreview.vn/api/medical/toplist-members-update.php",
   aiImagesUrl: "https://medreview.vn/api/medical/facilities-needing-ai-images.php?page=1&limit=1&min_images=3",
@@ -80,6 +82,11 @@ function migrateApiSetting(key, value) {
   } catch { return value; }
 }
 const SOURCE_INFO = {
+  handbook: {
+    label: "Cẩm nang", pluralLabel: "bài Cẩm nang", queueHeading: "Chủ đề Cẩm nang",
+    resultsHeading: "Cẩm nang đã xử lý", resultsKicker: "HTML + ẢNH",
+    promptTitle: "Prompt Cẩm nang từ website", resultFormat: "HTML"
+  },
   facility: {
     label: "Cơ sở", pluralLabel: "cơ sở", queueHeading: "Danh sách bài",
     resultsHeading: "Kết quả đã viết", resultsKicker: "JSON",
@@ -347,6 +354,7 @@ async function loadArticles() {
 }
 
 function articleSource(item) {
+  if (item?.sourceType === "handbook") return "handbook";
   if (item?.sourceType === "facility_image_fix") return "facility_image_fix";
   if (item?.sourceType === "translation") return "translation";
   if (item?.sourceType === "doctor" || item?.doctor_id != null) return "doctor";
@@ -419,7 +427,7 @@ function mergeApiArticles(current, incoming, sourceType) {
   const items = [...(current || [])];
   const existing = new Map(items.map((item) => {
     const type = articleSource(item);
-    const sourceId = type === "translation" ? item.source_id : type === "doctor" ? item.doctor_id : type === "toplist" ? item.toplist_id : item.facility_id;
+    const sourceId = type === "handbook" ? item.handbook_id : type === "translation" ? item.source_id : type === "doctor" ? item.doctor_id : type === "toplist" ? item.toplist_id : item.facility_id;
     const subtype = type === "translation" ? normalizeTranslationType(item.type || item.translation_type) : "";
     return [type === "translation" ? `translation-${subtype}-${sourceId ?? item.id}` : `${type}-${sourceId ?? item.id}`, item];
   }));
@@ -465,7 +473,7 @@ function mergeApiArticles(current, incoming, sourceType) {
       id, sourceType,
       ...(sourceType === "translation"
         ? { type, translation_type: type, source_id: sourceId }
-        : sourceType === "doctor" ? { doctor_id: entry.id }
+        : sourceType === "handbook" ? { handbook_id: entry.id } : sourceType === "doctor" ? { doctor_id: entry.id }
           : sourceType === "toplist" ? { toplist_id: entry.id } : { facility_id: entry.id }),
       title: sourceType === "translation"
         ? entry.title || entry.name || entry.source?.name || entry.source?.title || `Bản dịch ${type} #${sourceId}`
@@ -543,7 +551,11 @@ function imageFixErrorCode(item) {
 }
 
 function imageFixNeedsResearch(item) {
-  return !item.image_fix_api_pending && !item.image_fix_import_pending && (item.image_fix_requires_research || ["images_changed", "lease_lost"].includes(imageFixErrorCode(item)));
+  const code = imageFixErrorCode(item);
+  if (code === "insufficient_replacement_images" || /Chưa cập nhật xóa ảnh:.*\/5 ảnh thật đã xác minh/i.test(String(item?.api_error || item?.error || ""))) {
+    return false;
+  }
+  return !item.image_fix_api_pending && !item.image_fix_import_pending && (item.image_fix_requires_research || ["images_changed", "lease_lost"].includes(code));
 }
 
 function imageFixErrorDetail(item) {
@@ -580,6 +592,13 @@ function promptDebugLabel(item) {
 
 function displayJobStatus(item) {
   const status = item?.status || "chờ";
+  if (articleSource(item) === "handbook") {
+    if (status === "hoàn tất") return "đã lưu nháp · chưa xuất bản";
+    if (["missing_images", "image_decode_failed", "image_mime_mismatch", "image_too_large"].includes(item.handbook_error_code)) return "thiếu hoặc lỗi file minh hoạ AI";
+    if (item.handbook_error_code === "handbook_capability_error") return "AI chưa cung cấp file ảnh thật";
+    if (["source_revision_changed", "not_eligible", "idempotency_conflict", "lease_lost"].includes(item.handbook_error_code)) return "chủ đề/quyền giữ đã đổi · cần đối chiếu";
+    return { "đang viết": "đang viết HTML + tạo ảnh", "đang cập nhật": "đang gửi HTML + ảnh", "chưa xác nhận": "chưa xác nhận · giữ payload để gửi lại" }[status] || status;
+  }
   if (item?.writer_claimed === true && status === "chờ") {
     return `${isFacilityImageFixJob(item) ? "đang giữ bài" : "đang viết"} · ${writerClaimDisplayLabel(item.writer_claim)}`;
   }
@@ -792,6 +811,7 @@ function renderApiStatus() {
     const imageFixQueued = imageFixJob && success && imageFixImagesQueued(item);
     const translationJob = articleSource(item) === "translation";
     const doctorJob = articleSource(item) === "doctor";
+    const handbookJob = articleSource(item) === "handbook";
     const imageErrors = imageFixJob ? fixImport.results.filter((entry) => entry.ok === false) : Array.isArray(item.api_update?.image_errors) ? item.api_update.image_errors : [];
     const galleryRequested = Number(item.api_update?.gallery_images_requested ?? item.api_update?.images_requested ?? 0);
     const galleryImported = Number(item.api_update?.gallery_images_imported ?? item.api_update?.images_imported ?? 0);
@@ -805,7 +825,7 @@ function renderApiStatus() {
     const sendingElapsed = item.status === "đang cập nhật" ? elapsedLabel(item.api_request_started_at) : "";
     const translatedStatus = String(item.api_update?.status || item.api_update?.translation?.status || "").toLowerCase();
     const savedDraft = translationJob && (!translatedStatus || ["draft", "nháp", "saved_draft", "success", "ok"].includes(translatedStatus));
-    const detail = imageFixPartial ? imageFixErrorDetail(item) : success
+    const detail = handbookJob && success ? `Đã lưu Cẩm nang nháp · ${item.api_update?.images_count || 0} ảnh nội bộ · chưa xuất bản` : imageFixPartial ? imageFixErrorDetail(item) : success
       ? imageFixJob ? imageFixSuccessMessage(item) : translationJob ? `${savedDraft ? "Đã lưu bản dịch nháp" : "Đã lưu bản dịch"}${item.api_update?.slug ? ` · ${item.api_update.slug}` : ""}${item.api_update?.translation_id != null ? ` · ID ${item.api_update.translation_id}` : ""}${Array.isArray(item.api_update?.saved_fields) ? ` · ${item.api_update.saved_fields.length} trường` : ""}` : doctorJob ? (isDoctorInsufficient(item) ? "Đã lưu nghiên cứu thiếu dữ liệu · hoàn tất, không tự viết lại" : "Đã lưu hồ sơ bác sĩ · chờ duyệt") : `${imageJob ? "Đã gửi ảnh AI thành công" : "Đã gửi thành công"}${updateCount != null ? ` · ${updateCount} mục` : ""}${imageProgress}${imageErrors.length ? ` · ${imageErrors.length} ảnh chưa xếp hàng` : ""}`
       : item.status === "đang cập nhật" ? `${imageFixJob ? "Website đang tải/lưu ảnh" : imageJob ? "Đang gửi ảnh AI" : "Đang gửi website"}${sendingElapsed ? ` · ${sendingElapsed}` : ""} · JSON đã lưu`
         : uncertain ? `${item.api_error || "Chưa có xác nhận sau 30 phút"} JSON vẫn được lưu.`
@@ -815,7 +835,7 @@ function renderApiStatus() {
     const imageBadge = imageFixPartial ? `<button class="image-progress partial image-errors" title="${escapeHtml(detail)}" aria-label="Xem chi tiết ảnh chưa lưu">${fixImport.imported} lưu · ${fixImport.failed} lỗi</button>` : imageFixJob && success && fixImport.processing === "completed" ? `<span class="image-progress ok" title="${escapeHtml(detail)}">${fixImport.imported} ảnh lưu</span>` : imageFixQueued ? `<span class="image-progress queued" title="${escapeHtml(detail)}">Chờ worker</span>` : galleryRequested > 0 && !imageFixJob ? (imagesQueuedForWorker
       ? `<span class="image-progress queued" title="${escapeHtml(imageProgress.trim())}"><span aria-hidden="true">◷</span> ${galleryQueued || galleryRequested} ảnh chờ</span>`
       : `<span class="image-progress ${galleryImported >= galleryRequested ? "ok" : "partial"}" title="${escapeHtml(imageProgress.trim())}">${galleryImported}/${galleryRequested} ảnh</span>`) : "";
-    const canRetryUpdate = hasSavedResult(item) && item.status !== "đang cập nhật" && !(doctorJob && success) && !(imageFixJob && (success && !imageFixPartial || imageFixNeedsResearch(item)));
+    const canRetryUpdate = hasSavedResult(item) && item.status !== "đang cập nhật" && !((doctorJob || handbookJob) && success) && !(imageFixJob && (success && !imageFixPartial || imageFixNeedsResearch(item)));
     const researchAction = imageFixNeedsResearch(item) && !success && item.status !== "đang cập nhật" ? '<button class="tiny-button retry-image-fix-research" title="Lấy ảnh hiện tại và đưa vào hàng đợi kiểm tra lại bằng AI">Kiểm tra lại</button>' : "";
     row.innerHTML = `<span class="api-state ${stateClass}" title="${escapeHtml(detail)}">${stateIcon}</span><span class="api-name" title="${escapeHtml(detail)}">${escapeHtml(displayArticleTitle(item))}</span>${imageBadge}${imageErrors.length && !imageFixJob ? `<button class="image-errors" title="Xem chi tiết ${imageErrors.length} ảnh không lưu">${imageErrors.length} ảnh lỗi</button>` : ""}${canRetryUpdate ? `<button class="retry-api">${imageJob ? "Gửi lại ảnh" : "Gửi lại"}</button>` : ""}${researchAction}`;
     const update = item.status === "đang cập nhật" ? () => {
@@ -960,6 +980,7 @@ function setStatus(text, error = false) {
   $("statusLine").dataset.state = error ? "error" : /đang|bắt đầu|tải/i.test(text) ? "live" : "ready";
 }
 const SYSTEM_PHASE_LABELS = {
+  "writing-images": "Đang viết và tạo ảnh Cẩm nang", "attaching-images": "Đang gắn file ảnh thật vào HTML",
   preparing: "Đang chuẩn bị bài", connecting: "Đang kết nối tab AI", claiming: "Đang xin quyền xử lý bài",
   "finding-input": "Đang tìm ô nhập prompt", filling: "Đang nạp prompt", "waiting-send": "Prompt đã điền · chờ gửi",
   sending: "Đang gửi prompt", "waiting-ai": "Đang chờ AI viết xong", "reading-json": "Đang lấy JSON",

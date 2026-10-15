@@ -32,7 +32,7 @@
             <button id="clear" class="icon-button danger-hover" title="Xoá hết danh sách" aria-label="Xoá hết danh sách"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 10v6m4-6v6"/></svg></button>
           </div>
         </div>
-        <label class="source-picker">Nguồn tác vụ<select id="sourceType"><option value="facility">Cơ sở y tế</option><option value="doctor">Viết hồ sơ bác sĩ</option><option value="facility_image_fix">Fix ảnh cơ sở y tế</option><option value="toplist">Toplist</option><option value="ai-image">Tạo ảnh AI</option><option value="translation">Dịch Việt → Anh</option></select></label>
+        <label class="source-picker">Nguồn tác vụ<select id="sourceType"><option value="facility">Cơ sở y tế</option><option value="doctor">Viết hồ sơ bác sĩ</option><option value="handbook">Viết bài Cẩm nang</option><option value="facility_image_fix">Fix ảnh cơ sở y tế</option><option value="toplist">Toplist</option><option value="ai-image">Tạo ảnh AI</option><option value="translation">Dịch Việt → Anh</option></select></label>
         <label id="translationTypeWrap" class="source-picker" hidden>Loại dữ liệu<select id="translationType"><option value="facility">Cơ sở y tế</option><option value="doctor">Bác sĩ</option><option value="toplist">Toplist</option></select></label>
         <p id="providerCapabilityHint" class="provider-capability-hint" role="status" hidden></p>
         <section id="queueLoadError" class="queue-load-error" role="alert" aria-labelledby="queueErrorTitle" hidden>
@@ -70,6 +70,11 @@
     <div class="settings-sheet">
       <div class="dialog-header"><div class="dialog-heading"><span class="eyebrow">KẾT NỐI WEBSITE</span><h2 id="settingsTitle">Cài đặt API</h2></div><button id="closeSettings" class="icon-button" aria-label="Đóng cài đặt" title="Đóng">×</button></div>
       <div class="settings-body">
+        <div class="settings-group"><h3>Cẩm nang · HTML và ảnh AI</h3>
+          <label>URL lấy chủ đề / giữ bài<input id="handbooksUrl" type="url" spellcheck="false" autocomplete="off"></label>
+          <label>URL nhận HTML + BASE64<input id="handbookUpdateUrl" type="url" spellcheck="false" autocomplete="off"></label>
+          <p class="settings-help">Dùng language=vi hoặc en trong URL. Cẩm nang có khóa riêng; cần 1–4 file ảnh AI thật (nên 2), mỗi ảnh tối đa 5 MiB. HTML lỗi/thiếu ảnh giữ trong IndexedDB để đối chiếu. Website lưu nháp, chưa xuất bản. Không dùng URL ảnh tạm hoặc BASE64 giả.</p>
+        </div>
         <div class="settings-group"><h3><span class="group-number">01</span>Cơ sở y tế</h3>
           <label>URL lấy danh sách bài<input id="facilitiesUrl" type="url" spellcheck="false" autocomplete="off"></label>
           <label>URL nhận JSON cơ sở<input id="updateUrl" type="url" spellcheck="false" autocomplete="off"></label>

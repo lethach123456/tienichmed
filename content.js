@@ -73,7 +73,9 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         // failed while the old document is being replaced; recovery on the
         // new document will collect the answer instead.
         if (error?.code === "gemini-spark-reload" || error?.code === "gemini-spark-navigation") return;
-        return chrome.runtime.sendMessage({ type: "article-failed", articleId: message.article.id, runToken: message.article.runToken, error: error.message, rawResponse: error.rawResponse });
+        return chrome.runtime.sendMessage({ type: "article-failed", articleId: message.article.id, runToken: message.article.runToken,
+          error: message.article.sourceType === "handbook" ? MedReviewHandbook.safeError(error) : error.message,
+          errorCode: error.code, rawResponse: message.article.sourceType === "handbook" ? undefined : error.rawResponse });
       });
     sendResponse({ ok: true, started: true });
   }
@@ -115,6 +117,7 @@ async function retryPendingRecovery() {
 }
 
 function expectedArticleId(article) {
+  if (article?.sourceType === "handbook") return { sourceType: "handbook", id: article.handbook_id, language: article.language };
   if (article?.sourceType === "translation") {
     return {
       sourceType: "translation",
@@ -186,9 +189,10 @@ async function recoverPendingArticle() {
       }
     );
     reportSystemPhase(article.id, article.runToken, "saving-json", "Đã khôi phục JSON hợp lệ đúng ID. Đang nạp kết quả vào tiện ích và gửi lên website.");
+    const recoveredData = article.sourceType === "handbook" ? await prepareHandbookOutput(article, data, null) : data;
     const saved = await chrome.runtime.sendMessage({
       type: "article-complete", articleId: article.id, runToken: article.runToken,
-      article: data, rawResponse
+      article: recoveredData, rawResponse: article.sourceType === "handbook" ? undefined : rawResponse
     });
     if (!saved || saved.ok !== true) throw new Error(saved?.error || "Không thể lưu kết quả bài viết.");
     clearGeminiSparkStallRecovery(article.id);
@@ -262,6 +266,8 @@ function reportSystemPhase(articleId, runToken, phase, detail) {
 }
 
 async function runArticleAttempt(article, prompt, startupTiming) {
+  const handbookImages = article.sourceType === "handbook" ? latestGeneratedImages() : null;
+  if (handbookImages) handbookImages.nodes = new Set(generatedImageResponseNodes());
   clearJsonFormatRetryState(article.id, article.runToken);
   try { sessionStorage.removeItem(`${IMAGE_FIX_REPLACEMENT_RETRY_STORAGE_PREFIX}${jsonFormatRetryKey(article.id, article.runToken)}`); } catch {}
   const spark = isGeminiSparkPage();
@@ -335,12 +341,28 @@ async function runArticleAttempt(article, prompt, startupTiming) {
   }
   const expected = expectedArticleId(article);
   reportSystemPhase(article.id, article.runToken, "waiting-ai", spark ? "Đã gửi prompt. Kiểm tra nút Stop mỗi giây; khi AI đang viết, chưa quét JSON." : "Đã gửi prompt. Đang chờ AI hoàn tất câu trả lời.");
-  const response = await waitForResponse(previous, article.id, ARTICLE_WAIT_TIMEOUT_MS, expected, {
-    runToken: article.runToken, imageFixArticle: article.sourceType === "facility_image_fix" ? article : null
+  if (handbookImages) reportSystemPhase(article.id, article.runToken, "writing-images", "Đang chờ nội dung Cẩm nang và ảnh minh hoạ thật từ công cụ AI.");
+  let response = await waitForResponse(previous, article.id, ARTICLE_WAIT_TIMEOUT_MS, expected, {
+    runToken: article.runToken, imagePrevious: handbookImages,
+    imageFixArticle: article.sourceType === "facility_image_fix" ? article : null
   });
+  if (handbookImages && response.directImage) {
+    const generated = freshHandbookImages(handbookImages);
+    if (!generated.length) throw MedReviewHandbook.error("missing_images", "Không xác định được file minh hoạ thuộc đúng bài Cẩm nang.");
+    const previousJson = latestAssistantResponse();
+    const followup = await waitForInput();
+    const followupPrompt = `Đã nhận ${generated.length} file minh hoạ do công cụ tạo cho bài Cẩm nang id ${article.handbook_id}, language ${article.language}. Hãy trả TOÀN BỘ JSON cuối cùng theo đúng schema trong yêu cầu trước, giữ nội dung đầy đủ. Không bịa BASE64. Trong content_html dùng chính xác src="handbook-image:1" đến src="handbook-image:${generated.length}" theo thứ tự file vừa tạo để tiện ích gắn bytes ảnh thật. Chỉ trả một block code json, không token hoặc revision.`;
+    setInputValue(followup, followupPrompt);
+    if (PROVIDER === "chatgpt" && !await waitForPromptInComposer(followup, followupPrompt, 20000)) throw new Error("Chưa điền đủ yêu cầu nhận HTML Cẩm nang.");
+    if (!await submitPrompt(followup)) throw new Error("Không gửi được yêu cầu nhận JSON Cẩm nang sau tạo ảnh.");
+    response = await waitForResponse(previousJson, article.id, ARTICLE_WAIT_TIMEOUT_MS, expected, { runToken: article.runToken });
+    handbookImages.bound = generated;
+  }
   const { data, rawResponse } = response;
+  const completedData = handbookImages ? await prepareHandbookOutput(article, data, handbookImages) : data;
   reportSystemPhase(article.id, article.runToken, "saving-json", "JSON đã hợp lệ và đúng ID bài. Đang chuyển kết quả về tiện ích để lưu và gửi lên website.");
-  const saved = await chrome.runtime.sendMessage({ type: "article-complete", articleId: article.id, runToken: article.runToken, article: data, rawResponse });
+  const saved = await chrome.runtime.sendMessage({ type: "article-complete", articleId: article.id, runToken: article.runToken,
+    article: completedData, rawResponse: handbookImages ? undefined : rawResponse });
   if (!saved || saved.ok !== true) throw new Error(saved?.error || "Không thể lưu kết quả bài viết.");
   clearGeminiSparkStallRecovery(article.id);
   clearGeminiSparkJsonRetry(article);
@@ -787,7 +809,7 @@ function needsFencedJsonContract() {
 }
 
 function needsStrictJsonResponse(expectedId) {
-  return expectedId?.sourceType === "doctor" || expectedId?.sourceType === "facility_image_fix";
+  return ["doctor", "handbook", "facility_image_fix"].includes(expectedId?.sourceType);
 }
 
 function responseHasJsonCodeBlock(snapshot, expectedId) {
@@ -916,15 +938,17 @@ function imageFixReplacementSummary(article, result) {
   const kept = new Set(inspected.filter((image) => imageFixReviewIsVerifiedKeep(image) && source.has(image.url) && !ai.has(image.url)).map((image) => image.url));
   const added = new Set((Array.isArray(result?.added_images) ? result.added_images : [])
     .filter((image) => image && validReplacementImageUrl(image.url, true) && typeof image.source === "string" && image.source.trim() && validReplacementImageUrl(image.source_url) && !source.has(image.url) && !ai.has(image.url)).map((image) => image.url));
-  return { removed, kept: kept.size, added: added.size, verified: kept.size + added.size, minimum: 5 };
+  const minimum = Number.isInteger(article?.minimum_verified_images) && article.minimum_verified_images > 0 ? article.minimum_verified_images : 0;
+  return { removed, kept: kept.size, added: added.size, verified: kept.size + added.size, minimum };
 }
 
 function imageFixReplacementPrompt(article, _result, summary) {
+  const minimum = summary?.minimum > 0 ? summary.minimum : 5;
   return [
-    `Kết quả Fix ảnh ID ${article.facility_id} vừa trả đã có ${summary.removed} ảnh remove, nhưng chỉ có K=${summary.kept} ảnh thật keep đã xác minh và N=${summary.added} ảnh mới; tổng ${summary.verified}/5, chưa đủ để cập nhật xóa ảnh.`,
-    `Hãy TIẾP TỤC ĐIỀU TRA và bổ sung ít nhất ${5 - summary.verified} ảnh thật khác nhau đã xem/xác minh của đúng chi nhánh: ${article.name || article.title || ""}, địa chỉ ${article.address_text || ""}.`,
+    `Kết quả Fix ảnh ID ${article.facility_id} vừa trả đã có ${summary.removed} ảnh remove, nhưng chỉ có K=${summary.kept} ảnh thật keep đã xác minh và N=${summary.added} ảnh mới; tổng ${summary.verified}/${minimum}, chưa đủ để cập nhật xóa ảnh.`,
+    `Hãy TIẾP TỤC ĐIỀU TRA và bổ sung ít nhất ${Math.max(1, minimum - summary.verified)} ảnh thật khác nhau đã xem/xác minh của đúng chi nhánh: ${article.name || article.title || ""}, địa chỉ ${article.address_text || ""}.`,
     "Rà nguồn lần lượt Google Maps đúng địa điểm → Facebook/fanpage đúng cơ sở → trang Giới thiệu/chi nhánh/cơ sở vật chất trên website chính thức → nguồn công khai khác. Không dừng chỉ vì một nguồn không trích được URL.",
-    "Đủ tối thiểu 5 nghĩa là ảnh thật nguồn keep đã xác minh có reason và evidence_url thật + ảnh mới hợp lệ; uncertain, ảnh AI, ảnh trùng, ảnh lỗi truy cập hoặc chưa xem/xác minh KHÔNG tính. Không đổi uncertain thành keep chỉ để đủ số lượng, không bịa hoặc tự ghép URL.",
+    `Đủ tối thiểu ${minimum} nghĩa là ảnh thật nguồn keep đã xác minh có reason và evidence_url thật + ảnh mới hợp lệ; uncertain, ảnh AI, ảnh trùng, ảnh lỗi truy cập hoặc chưa xem/xác minh KHÔNG tính. Không đổi uncertain thành keep chỉ để đủ số lượng, không bịa hoặc tự ghép URL.`,
     `Giữ nguyên id ${article.facility_id}, images_revision ${JSON.stringify(article.images_revision)} và đủ mọi inspected_images của nguồn; không bỏ hay thay URL nguồn. Giữ các ảnh keep hợp lệ, bổ sung vào added_images với URL trực tiếp, source và source_url thật.`,
     "Nếu thực sự vẫn chưa đủ sau khi rà hết nguồn, trả đúng ảnh đã xác minh, insufficient_images=true và notes ghi số thiếu/giới hạn truy cập; tiện ích sẽ giữ kết quả để kiểm tra lại, chưa gửi cập nhật xóa ảnh.",
     "Trả lại TOÀN BỘ JSON kết quả trong đúng một block code json, không chỉ trả phần bổ sung; không tạo ảnh AI và không thêm khóa bảo mật."
@@ -943,7 +967,7 @@ function promptForProvider(prompt, article = null) {
   // translated} response envelope or drops the source record context.
   // Doctor prompts already contain the complete server-controlled research
   // schema and JSON-block contract. Keep them verbatim on every provider.
-  if (translation || article?.sourceType === "doctor") return value;
+  if (translation || article?.sourceType === "doctor" || article?.sourceType === "handbook") return value;
   const pieces = [value];
   if (!needsFencedJsonContract()) return pieces.filter(Boolean).join("\n");
   // Grok and Spark render unfenced JSON as Markdown. Quotes inside HTML/text
@@ -2110,6 +2134,61 @@ function imageSource(image) {
   ).trim();
 }
 
+function freshHandbookImages(previous) {
+  if (!previous) return [];
+  const oldUrls = new Set(previous.images.map((image) => image.url));
+  return latestGeneratedImages().images.filter((image) => !previous.keys.has(image.key) && !oldUrls.has(image.url) &&
+    !previous.nodes?.has(image.node) && imageLooksLikeGeneratedAsset(image.image));
+}
+
+async function prepareHandbookOutput(article, data, previous) {
+  MedReviewHandbook.validate(article, data, { allowPlaceholders: true });
+  const tags = MedReviewHandbook.imageTags(data.content_html);
+  const placeholders = tags.filter((image) => /^handbook-image:[1-4]$/.test(image.uri));
+  if (!placeholders.length) {
+    // Pixel decoding rejects syntactically valid but fabricated/truncated data.
+    if (typeof createImageBitmap === "function") for (const image of tags) {
+      const response = await fetch(image.uri);
+      const bitmap = await createImageBitmap(await response.blob()).catch(() => null);
+      if (!bitmap || !bitmap.width || !bitmap.height || bitmap.width * bitmap.height > 12000000 || Math.max(bitmap.width, bitmap.height) > 8192) {
+        bitmap?.close?.();
+        throw MedReviewHandbook.error("image_decode_failed", "Không giải mã được file ảnh Cẩm nang hoặc kích thước vượt giới hạn.");
+      }
+      bitmap.close();
+    }
+    return data;
+  }
+  if (!["chatgpt", "grok"].includes(PROVIDER) || !previous) {
+    throw MedReviewHandbook.error("handbook_capability_error", "Chưa lấy được bytes ảnh minh hoạ thật từ provider/lượt này. Cần JSON có data ảnh thật hoặc tạo lại bằng ChatGPT/Grok; không dùng ảnh cũ hay fake BASE64.");
+  }
+  reportSystemPhase(article.id, article.runToken, "attaching-images", "Đang tải file minh hoạ mới của chính bài này, kiểm tra và gắn BASE64 vào HTML.");
+  const images = previous.bound || freshHandbookImages(previous);
+  const slots = [...new Set(placeholders.map((image) => Number(image.uri.split(":")[1])))];
+  if (!images.length || images.length > 4 || slots.some((slot) => slot > images.length) || slots.length !== images.length) {
+    throw MedReviewHandbook.error("missing_images", "Số/vị trí placeholder không khớp file ảnh mới của bài Cẩm nang; chưa tự chọn ảnh bất kỳ trên giao diện.");
+  }
+  let html = data.content_html;
+  for (const slot of slots) {
+    const { blob, mimeType } = await fetchGeneratedImageBlob(images[slot - 1]);
+    if (!["image/png", "image/jpeg", "image/webp"].includes(mimeType) || blob.size > MedReviewHandbook.limits.imageBytes) {
+      throw MedReviewHandbook.error("image_too_large", "Ảnh Cẩm nang cần PNG/JPEG/WebP tối đa 5 MiB; chưa gắn file khác định dạng.");
+    }
+    const dataUrl = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => reject(MedReviewHandbook.error("missing_images", "Không đọc được bytes file minh hoạ."));
+      reader.readAsDataURL(blob);
+    });
+    MedReviewHandbook.imageData(dataUrl);
+    for (const image of placeholders.filter((tag) => tag.uri === `handbook-image:${slot}`)) {
+      html = html.replace(image.tag, image.tag.replace(/(\bsrc\s*=\s*)(["'])(.*?)\2/is, (_match, prefix, quote) => `${prefix}${quote}${dataUrl}${quote}`));
+    }
+  }
+  const result = { ...data, content_html: html };
+  MedReviewHandbook.validate(article, result);
+  return prepareHandbookOutput(article, result, null);
+}
+
 function generatedImageCard(image) {
   return image?.closest?.([
     "button[aria-label^='Ảnh đã tạo:']",
@@ -2478,7 +2557,7 @@ async function waitForResponse(previous, articleId, timeout = ARTICLE_WAIT_TIMEO
             // JSON is read. Persist the one follow-up across recovery reloads.
             replacementRetrySent = true;
             try { sessionStorage.setItem(replacementRetryKey, "sent"); } catch {}
-            reportSystemPhase(articleId, options.runToken, "finding-replacement-images", `Đã loại ${summary.removed} ảnh nhưng mới có ${summary.verified}/5 ảnh thật đã xác minh. Đang yêu cầu AI tìm ảnh thay thế; chưa gửi cập nhật xóa ảnh.`);
+            reportSystemPhase(articleId, options.runToken, "finding-replacement-images", `Đã loại ${summary.removed} ảnh nhưng mới có ${summary.verified}/${summary.minimum} ảnh thật đã xác minh. Đang yêu cầu AI tìm ảnh thay thế; chưa gửi cập nhật xóa ảnh.`);
             try {
               retryBaseline = await requestJsonFormatRetry(articleId, expectedId, options.runToken, now,
                 imageFixReplacementPrompt(options.imageFixArticle, parsed.data, summary));
@@ -2545,6 +2624,8 @@ async function waitForResponse(previous, articleId, timeout = ARTICLE_WAIT_TIMEO
 }
 
 function jsonMatchesExpectedId(data, expectedId) {
+  if (expectedId?.sourceType === "handbook") return Boolean(data && !Array.isArray(data) && Number.isSafeInteger(data.id) &&
+    data.id === expectedId.id && data.language === expectedId.language && typeof data.content_html === "string");
   if (expectedId?.sourceType === "facility_image_fix") {
     // Never accept a stale same-facility answer, a string ID, or an envelope
     // whose nested record happens to match. Background validates image detail.
@@ -2723,7 +2804,7 @@ function jsonCandidateScore(data, expectedId) {
   if (saved?.key === cacheKey) return saved.score;
   const translation = expectedId?.sourceType === "translation";
   const toplist = expectedId?.sourceType === "toplist";
-  const doctor = expectedId?.sourceType === "doctor";
+  const doctor = ["doctor", "handbook"].includes(expectedId?.sourceType);
   const expected = translation ? expectedId.source_id : toplist || doctor ? expectedId.id : expectedId;
   const records = Array.isArray(data) ? data : Array.isArray(data.items) ? data.items : [data];
   let score = -Infinity;

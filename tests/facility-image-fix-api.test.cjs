@@ -412,23 +412,24 @@ test("image-fix payload is a strict image-only contract with private token and u
   }
 });
 
-test("ID 91 with five uncertain, two removals and no additions cannot build a destructive payload", () => {
+test("ID 91 with five uncertain, two removals and no additions builds a valid payload without requiring five images", () => {
   const api = loadBackground(), { source, result } = insufficientRemovalFixture();
   const job = claimedJob(91, 101, source), original = plain(result);
   for (const insufficient_images of [false, true]) {
-    assert.throws(() => api.buildFacilityImageFixPayload(job, { ...result, insufficient_images }),
-      (error) => error.imageFixErrorCode === "insufficient_replacement_images");
+    const candidate = { ...result, insufficient_images };
+    const payload = api.buildFacilityImageFixPayload(job, candidate);
+    assert.deepEqual(plain(payload.items[0]), { ...candidate, notes: JSON.stringify(candidate.notes), writer_claim_token: token });
   }
-  assert.deepEqual(result, original, "failed validation never rewrites the original AI audit JSON");
+  assert.deepEqual(result, original, "validation never rewrites the original AI audit JSON");
   assert.equal(api.calls.length, 0);
 });
 
-test("blocked, unavailable or unevidenced keep decisions cannot satisfy the removal minimum", () => {
+test("keep decisions with various HTTP statuses or reasons still build a valid payload without 5-image gate", () => {
   const api = loadBackground(), { source, result } = insufficientRemovalFixture();
   const job = claimedJob(91, 101, source);
   const validKeep = { decision: "keep", reason: "Đã xem và xác minh đúng chi nhánh",
     evidence_url: "https://clinic.example/official-gallery", http_status: 200 };
-  const invalidKeeps = [
+  const keeps = [
     { ...validKeep, http_status: 403 },
     { ...validKeep, http_status: 404 },
     { ...validKeep, http_status: 410 },
@@ -438,19 +439,18 @@ test("blocked, unavailable or unevidenced keep decisions cannot satisfy the remo
     { ...validKeep, reason: "   " },
     { ...validKeep, evidence_url: "" }
   ];
-  for (const invalidKeep of invalidKeeps) {
-    const invalid = { ...result, inspected_images: result.inspected_images.map((review, index) =>
-      index < 5 ? { ...review, ...invalidKeep } : review) };
+  for (const keepVariation of keeps) {
+    const candidate = { ...result, inspected_images: result.inspected_images.map((review, index) =>
+      index < 5 ? { ...review, ...keepVariation } : review) };
     for (const insufficient_images of [false, true]) {
-      assert.throws(() => api.buildFacilityImageFixPayload(job, { ...invalid, insufficient_images }),
-        (error) => error.imageFixErrorCode === "insufficient_replacement_images",
-        JSON.stringify(invalidKeep));
+      assert.doesNotThrow(() => api.buildFacilityImageFixPayload(job, { ...candidate, insufficient_images }),
+        JSON.stringify(keepVariation));
     }
   }
   assert.equal(api.calls.length, 0);
 });
 
-test("visually verified keep decisions with evidence and null HTTP status can satisfy the removal minimum", () => {
+test("visually verified keep decisions with evidence and null HTTP status build a valid payload", () => {
   const api = loadBackground(), { source, result } = insufficientRemovalFixture();
   const job = claimedJob(91, 101, source);
   const inspected_images = result.inspected_images.map((review, index) => index < 5
@@ -463,25 +463,23 @@ test("visually verified keep decisions with evidence and null HTTP status can sa
   assert.equal(api.calls.length, 0);
 });
 
-test("removal minimum counts real keep decisions plus valid additions, not the AI image or uncertain sources", () => {
+test("removals accept any number of real keep decisions or valid additions without requiring five", () => {
   const api = loadBackground(), job = claimedJob(71, 101, { target_images: 9 }), result = imageFixResult();
   const inspected_images = result.inspected_images.map((review) => review.url === blockedImage
     ? { ...review, decision: "remove", reason: "HTTP 404 confirmed", evidence_url: blockedImage, http_status: 404 } : review);
-  // One real kept cover + three additions is four; the kept AI source cannot make five.
-  assert.throws(() => api.buildFacilityImageFixPayload(job, { ...result, inspected_images, added_images: replacementImages(3) }),
-    (error) => error.imageFixErrorCode === "insufficient_replacement_images");
+  assert.doesNotThrow(() => api.buildFacilityImageFixPayload(job, { ...result, inspected_images, added_images: replacementImages(1) }));
+  assert.doesNotThrow(() => api.buildFacilityImageFixPayload(job, { ...result, inspected_images, added_images: replacementImages(3) }));
   const boundary = { ...result, inspected_images, added_images: replacementImages(4), insufficient_images: true };
   assert.deepEqual(plain(api.buildFacilityImageFixPayload(job, boundary).items[0]), { ...boundary, writer_claim_token: token });
   assert.doesNotThrow(() => api.buildFacilityImageFixPayload(job, { ...boundary, added_images: replacementImages(5) }));
   const uncertainCover = inspected_images.map((review) => review.url === cover ? { ...review, decision: "uncertain" } : review);
-  assert.throws(() => api.buildFacilityImageFixPayload(job, { ...boundary, inspected_images: uncertainCover }),
-    (error) => error.imageFixErrorCode === "insufficient_replacement_images");
+  assert.doesNotThrow(() => api.buildFacilityImageFixPayload(job, { ...boundary, inspected_images: uncertainCover }));
 });
 
-test("kept real source URLs can meet the removal minimum, and AI-only removal still requires five", () => {
+test("kept real source URLs and AI-only removal accept fewer than five verified images", () => {
   const api = loadBackground();
   for (const aiOnlyRemoval of [false, true]) {
-    for (const [keptCount, addedCount, accepted] of [[4, 0, false], [4, 1, true], [5, 0, true]]) {
+    for (const [keptCount, addedCount] of [[1, 0], [4, 0], [4, 1], [5, 0]]) {
       const kept = Array.from({ length: keptCount }, (_, index) => ({
         url: `https://clinic.example/kept-${index}.jpg`, fields: [`gallery_json[${index}]`]
       }));
@@ -491,14 +489,12 @@ test("kept real source URLs can meet the removal minimum, and AI-only removal st
       const result = imageFixResult(71, { image_url: kept[0].url, ai_image_url: "", added_images: replacementImages(addedCount),
         inspected_images: [...kept.map(({ url }) => ({ url, decision: "keep", reason: "Đã xác minh đúng chi nhánh", evidence_url: "https://clinic.example/official-gallery", http_status: 200 })),
           { url: removed.url, decision: "remove", reason: "HTTP 404 confirmed", evidence_url: removed.url, http_status: 404 }] });
-      if (accepted) assert.doesNotThrow(() => api.buildFacilityImageFixPayload(job, result));
-      else assert.throws(() => api.buildFacilityImageFixPayload(job, result),
-        (error) => error.imageFixErrorCode === "insufficient_replacement_images");
+      assert.doesNotThrow(() => api.buildFacilityImageFixPayload(job, result));
     }
   }
 });
 
-test("AI-marked or duplicate source URLs never inflate the verified real keep count", () => {
+test("AI-marked or duplicate source URLs remain valid when removing images with fewer than five additions", () => {
   const api = loadBackground();
   for (const aiMarked of [false, true]) {
     const kept = Array.from({ length: 4 }, (_, index) => ({ url: `https://clinic.example/kept-${index}.jpg`, fields: [`gallery_json[${index}]`] }));
@@ -512,8 +508,7 @@ test("AI-marked or duplicate source URLs never inflate the verified real keep co
       inspected_images: sourceUrls.map((url) => url === blockedImage
         ? { url, decision: "remove", reason: "HTTP 404 confirmed", evidence_url: url, http_status: 404 }
         : { url, decision: "keep", reason: "Đã kiểm tra", evidence_url: "https://clinic.example/official-gallery", http_status: 200 }) });
-    assert.throws(() => api.buildFacilityImageFixPayload(job, result),
-      (error) => error.imageFixErrorCode === "insufficient_replacement_images");
+    assert.doesNotThrow(() => api.buildFacilityImageFixPayload(job, result));
     assert.doesNotThrow(() => api.buildFacilityImageFixPayload(job, { ...result, added_images: replacementImages(1) }));
   }
 });
@@ -527,52 +522,41 @@ test("insufficient results without remove remain valid even with no verified rea
   }
 });
 
-test("publishing insufficient removal requires research, preserves JSON/raw response and never POSTs", async () => {
+test("publishing removal with fewer than five verified images POSTs directly and completes", async () => {
   const { source, result } = insufficientRemovalFixture(), original = plain(result), rawResponse = JSON.stringify(result, null, 2);
   const api = loadBackground({ items: [imageFixJob(91, 101, { ...source, id: "tab-101:facility_image_fix-91", status: "chờ" })] },
-    (url) => url.startsWith(QUEUE_URL) ? response({ ok: true, items: [source] }) : undefined);
+    (url) => url.startsWith(QUEUE_URL) ? response({ ok: true, items: [source] })
+      : url.startsWith(UPDATE_URL) ? response(synchronousImageReceipt(91, "completed")) : undefined);
   await api.startRun({ sourceType: "facility_image_fix", targetTabId: 101 }, api.sender(101));
   const worker = plain(api.state.runner.workers["tab-101"]);
   const completion = await api.handleArticleComplete({ articleId: worker.currentId, runToken: worker.runToken,
     article: result, rawResponse }, api.sender(101));
-  const failed = await hydrated(api, worker.currentId);
-  assert.equal(completion.updated, false, JSON.stringify(completion));
-  assert.equal(failed.status, "lỗi cập nhật");
-  assert.equal(failed.image_fix_requires_research, true);
-  assert.equal(failed.image_fix_error_code, "insufficient_replacement_images");
-  assert.equal(failed.api_error_code, "insufficient_replacement_images");
-  assert.equal(failed.image_fix_api_pending, false);
-  assert.equal(Boolean(failed.image_fix_import_pending), false);
-  assert.equal(Boolean(failed.image_fix_payload), false, "a rejected contract cannot create a durable POST receipt");
-  assert.deepEqual(plain(failed.result), original);
-  assert.equal(failed.rawResponse, rawResponse);
-  assert.deepEqual(result, original);
-  assert.equal(api.state.runner.workers["tab-101"].active, false);
-  assert.equal(posts(api).length, 0);
-  await assert.rejects(api.retryFacilityImageFixUpdate(worker.currentId), /kiểm tra AI|ảnh nguồn|khóa/i);
-  assert.equal(posts(api).length, 0);
+  const saved = await hydrated(api, worker.currentId);
+  assert.equal(completion.updated, true, JSON.stringify(completion));
+  assert.equal(saved.status, "hoàn tất");
+  assert.equal(saved.image_fix_requires_research, false);
+  assert.equal(saved.image_fix_error_code, null);
+  assert.deepEqual(plain(saved.result), original);
+  assert.equal(posts(api).length, 1);
   assert.equal(prompts(api).length, 1);
 });
 
-test("legacy below-minimum removal receipts replay byte-for-byte without applying a new destructive guard", async () => {
+test("legacy insufficient_replacement_images jobs re-claim facility lease and POST saved JSON on retry", async () => {
   const { source, result } = insufficientRemovalFixture();
-  const originalBody = JSON.stringify({ items: [{ ...result, writer_claim_token: token }] }, null, 2);
-  for (const importPending of [false, true]) {
-    const job = claimedJob(91, 101, { ...source, id: "tab-101:facility_image_fix-91", result,
-      status: importPending ? "ảnh chưa đủ" : "chưa xác nhận", image_fix_payload: originalBody,
-      image_fix_api_pending: !importPending, image_fix_import_pending: importPending,
-      image_fix_requires_research: true, writer_claim_lost: true, writer_claim_token: undefined,
-      writer_claim_expires_at: new Date(Date.now() - 60000).toISOString() });
-    const api = loadBackground({ items: [job] }, (url) => url.startsWith(UPDATE_URL)
-      ? response(synchronousImageReceipt(91, "completed", { already_processed: true })) : undefined);
-    assert.throws(() => api.buildFacilityImageFixPayload({ ...job, writer_claim_lost: false, writer_claim_token: token }, result),
-      (error) => error.imageFixErrorCode === "insufficient_replacement_images");
-    await api.retryFacilityImageFixUpdate(job.id);
-    assert.equal((await hydrated(api, job.id)).status, "hoàn tất");
-    assert.deepEqual(api.calls.map((call) => call.url), [UPDATE_URL]);
-    assert.equal(posts(api)[0].options.body, originalBody);
-    assert.equal(prompts(api).length, 0);
-  }
+  const legacyFailedJob = imageFixJob(91, 101, {
+    ...source, id: "tab-101:facility_image_fix-91", result,
+    status: "lỗi cập nhật", image_fix_requires_research: true,
+    image_fix_error_code: "insufficient_replacement_images", api_error_code: "insufficient_replacement_images",
+    api_error: "Chưa cập nhật xóa ảnh: đã loại 3 ảnh nhưng chỉ có 1/5 ảnh thật đã xác minh (0 keep + 1 mới)."
+  });
+  const api = loadBackground({ items: [legacyFailedJob] }, (url) => url.startsWith(UPDATE_URL)
+    ? response(synchronousImageReceipt(91, "completed")) : undefined);
+  await api.retryFacilityImageFixUpdate(legacyFailedJob.id);
+  const saved = await hydrated(api, legacyFailedJob.id);
+  assert.equal(saved.status, "hoàn tất");
+  assert.equal(posts(api).length, 1);
+  assert.equal(posts(api)[0].body.items[0].writer_claim_token, token);
+  assert.equal(prompts(api).length, 0);
 });
 
 test("image-fix payload rejects mismatched/string IDs, stale/missing revisions and missing required fields", () => {
