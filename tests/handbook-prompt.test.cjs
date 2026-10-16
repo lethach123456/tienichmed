@@ -25,8 +25,8 @@ function repeatedContract(api, prompt) {
   const rules = api.handbookInlineJsonRules();
   assert.ok(prompt.startsWith(rules), 'inline contract leads the prompt');
   assert.ok(prompt.endsWith(rules), 'inline contract closes the prompt');
-  for (const literal of ['```json', 'file .json', 'Tải JSON hoàn chỉnh', 'sandbox:/mnt/data', 'Canvas', 'artifact', 'File ẢNH thật', 'không rút gọn nội dung/BASE64',
-    'BASE64 đầy đủ HOẶC link HTTP(S) công khai trực tiếp', 'API sẽ tải, kiểm tra, nén và lưu cả hai dạng ảnh trên hosting']) {
+  for (const literal of ['```json', 'file .json', 'Tải JSON hoàn chỉnh', 'sandbox:/mnt/data', 'Canvas', 'artifact', 'File ẢNH thật', 'không rút gọn nội dung',
+    'link1_base64.txt', 'image_files', 'SHA-256', 'BYTES ẢNH GỐC', 'LOẠI image_files', 'KHÔNG CHÉP BASE64 DÀI VÀO CHAT']) {
     assert.ok(rules.includes(literal), `contract includes ${literal}`);
   }
 }
@@ -44,15 +44,16 @@ for (const hostname of ['chatgpt.com', 'gemini.google.com', 'grok.com', 'claude.
   });
 }
 
-test('post-image prompt retains exact bound image slots and rejects JSON-download substitution', () => {
+test('post-image prompt requests actual TXT files from completed images and compact JSON', () => {
   const api = load();
   for (const count of [1, 2, 4]) {
     const prompt = api.handbookJsonAfterImagesPrompt(article, count);
     repeatedContract(api, prompt);
     assert.ok(prompt.includes(`id 32, language vi`));
-    assert.ok(prompt.includes(`src="handbook-image:1" đến src="handbook-image:${count}"`));
+    assert.ok(prompt.includes(`src="link1" đến src="link${count}"`));
+    assert.ok(prompt.includes(`link${count}_base64.txt`));
     assert.ok(prompt.includes('không tạo lại ảnh'));
-    assert.ok(prompt.includes('Không trả file JSON, link tải'));
+    assert.ok(prompt.includes('Không trả file JSON hay tóm tắt'));
   }
 });
 

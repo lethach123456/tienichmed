@@ -3588,7 +3588,7 @@ async function startJob(article, prompt, workerKeyOrProvider, runToken) {
     if (!/Receiving end does not exist|Could not establish connection/i.test(String(error.message))) throw error;
   }
   if (!receiverReady && typeof chrome.scripting?.executeScript === "function") {
-    await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: isHandbookItem(article) ? ["handbook.js", "content.js"] : ["content.js"] });
+    await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: isHandbookItem(article) ? ["handbook.js", "handbook-files.js", "content.js"] : ["content.js"] });
   }
   startupTiming.receiverReadyMs = Date.now() - readyStartedAt;
   startupTiming.scriptInjected = !receiverReady;
@@ -3651,7 +3651,7 @@ async function startJob(article, prompt, workerKeyOrProvider, runToken) {
     if (workerMode && !await canDispatchWorkerJob(workerKeyOrProvider, article.id, runToken, tab.id, provider)) {
       throw workerReleasedError();
     }
-    await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: isHandbookItem(article) ? ["handbook.js", "content.js"] : ["content.js"] });
+    await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: isHandbookItem(article) ? ["handbook.js", "handbook-files.js", "content.js"] : ["content.js"] });
     if (workerMode && !await canDispatchWorkerJob(workerKeyOrProvider, article.id, runToken, tab.id, provider)) {
       throw workerReleasedError();
     }

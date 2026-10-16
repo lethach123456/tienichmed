@@ -64,7 +64,7 @@
       return { tag: tag[0], uri: source[2], index: tag.index };
     });
   }
-  function validate(job, result, { allowPlaceholders = false } = {}) {
+  function validate(job, result, { allowPlaceholders = false, allowFileRefs = false } = {}) {
     if (!result || typeof result !== "object" || Array.isArray(result) ||
         !Number.isSafeInteger(result.id) || result.id !== Number(job.handbook_id) || result.language !== job.language) {
       throw error("identity_mismatch", "JSON Cẩm nang phải đúng id nguyên và language của chủ đề đang nhận.");
@@ -84,12 +84,14 @@
     for (const field of ["claim_token", "writer_claim_token", "request_id", "source_revision", "status", "slug", "category_id"]) {
       if (Object.hasOwn(result, field)) throw error("protected_field", `AI không được gửi trường vận hành Cẩm nang: ${field}.`);
     }
+    if (!allowFileRefs && Object.hasOwn(result, "image_files")) throw error("unresolved_image_files", "Phải đọc file TXT, xác minh ảnh và loại image_files trước gửi API.");
     const tags = imageTags(result.content_html);
     if (!tags.length || tags.length > limits.images) throw error("missing_images", "Cẩm nang cần 1–4 ảnh minh hoạ AI thật (nên 2 ảnh).");
     const unique = new Set();
     let total = 0;
     for (const image of tags) {
       if (allowPlaceholders && /^handbook-image:[1-4]$/.test(image.uri)) continue;
+      if (allowFileRefs && /^link[1-4]$/.test(image.uri)) continue;
       if (/^https?:\/\//i.test(image.uri)) {
         if (!imageHttpUrl(image.uri)) throw error("invalid_image_url", "URL ảnh Cẩm nang cần HTTP(S) công khai trực tiếp, không nội bộ, token, URL tạm hay placeholder.");
         continue;

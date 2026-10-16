@@ -178,7 +178,7 @@ async function recoverPendingArticle() {
       return true;
     }
     const current = isGeminiSparkPage() ? latestAssistantResponseIdentity() : latestAssistantResponse();
-    const { data, rawResponse } = await waitForResponse(
+    const { data, rawResponse, responseSnapshot } = await waitForResponse(
       current, article.id, ARTICLE_WAIT_TIMEOUT_MS, expectedArticleId(article), {
         acceptCurrent: true,
         runToken: article.runToken,
@@ -189,7 +189,8 @@ async function recoverPendingArticle() {
       }
     );
     reportSystemPhase(article.id, article.runToken, "saving-json", "Đã khôi phục JSON hợp lệ đúng ID. Đang nạp kết quả vào tiện ích và gửi lên website.");
-    const recoveredData = article.sourceType === "handbook" ? await prepareHandbookOutput(article, data, null) : data;
+    const recoveredData = article.sourceType === "handbook" ? await prepareHandbookOutput(article, data, null, responseSnapshot) : data;
+    if (cancelledArticleId === article.id) throw new Error("Đã dừng bài viết.");
     const saved = await chrome.runtime.sendMessage({
       type: "article-complete", articleId: article.id, runToken: article.runToken,
       article: recoveredData, rawResponse: article.sourceType === "handbook" ? undefined : rawResponse
@@ -361,10 +362,11 @@ async function runArticleAttempt(article, prompt, startupTiming) {
     handbookImages.bound = generated;
   }
   const { data, rawResponse } = response;
-  const completedData = handbookImages ? await prepareHandbookOutput(article, data, handbookImages) : data;
+  const completedData = article.sourceType === "handbook" ? await prepareHandbookOutput(article, data, handbookImages, response.responseSnapshot) : data;
+  if (cancelledArticleId === article.id) throw new Error("Đã dừng bài viết.");
   reportSystemPhase(article.id, article.runToken, "saving-json", "JSON đã hợp lệ và đúng ID bài. Đang chuyển kết quả về tiện ích để lưu và gửi lên website.");
   const saved = await chrome.runtime.sendMessage({ type: "article-complete", articleId: article.id, runToken: article.runToken,
-    article: completedData, rawResponse: handbookImages ? undefined : rawResponse });
+    article: completedData, rawResponse: article.sourceType === "handbook" ? undefined : rawResponse });
   if (!saved || saved.ok !== true) throw new Error(saved?.error || "Không thể lưu kết quả bài viết.");
   clearGeminiSparkStallRecovery(article.id);
   clearGeminiSparkJsonRetry(article);
@@ -880,13 +882,13 @@ function clearJsonFormatRetryState(articleId, runToken) {
 
 function handbookInlineJsonRules() {
   return [
-    "ĐẦU RA CẨM NANG BẮT BUỘC: khi hoàn tất, in TOÀN BỘ JSON trực tiếp trong chat, trong ĐÚNG MỘT block code mở bằng ```json và đóng bằng ```; không giải thích bên ngoài block.",
-    "Không dùng file .json, link Tải JSON hoàn chỉnh, sandbox:/mnt/data, Canvas hoặc artifact thay cho block code. Dù đã tạo file JSON để kiểm tra, vẫn phải in JSON đầy đủ ngay trong chat; tiện ích không đọc link tải file.",
-    "Giữ đầy đủ HTML, nguồn, id và language; JSON-escape đúng dấu nháy/xuống dòng. Không chia block, không rút gọn nội dung/BASE64, không chèn dấu ... hay bịa bytes ảnh để đủ định dạng.",
-    "Hợp đồng ảnh Cẩm nang hiện hành cho phép cùng bài dùng cả hai dạng: file PNG/JPEG/WebP thật đã mã hoá BASE64 đầy đủ HOẶC link HTTP(S) công khai trực tiếp tới file PNG/JPEG/WebP thật. Không URL tạm, blob:, sandbox:, trang xem ảnh, link có token hay placeholder; không bịa hoặc cắt BASE64. Quy tắc này thay thế hướng dẫn chỉ nhận BASE64 nếu prompt cũ còn ghi như vậy.",
-    "Trong content_html đặt mỗi ảnh trong img src bằng BASE64 thật hoặc link ảnh công khai trực tiếp; không tự đổi link thành BASE64 giả. API sẽ tải, kiểm tra, nén và lưu cả hai dạng ảnh trên hosting, rồi thay src bằng URL nội bộ.",
-    "File ẢNH thật từ công cụ tạo ảnh vẫn được phép đính kèm. Chỉ dùng handbook-image:N khi tiện ích đã xác nhận và chỉ định các file ảnh thật đó; tiện ích sẽ thay bằng BASE64 thật trước gửi API. Không tự tạo mã ảnh khi chưa được chỉ định.",
-    "Nếu chưa thể xuất đầy đủ hoặc chưa có ảnh thật, báo rõ chưa hoàn tất, không báo thành công giả. Khi hoàn tất: CHỈ MỘT BLOCK ```json CHỨA TOÀN BỘ JSON NGAY TRONG CHAT."
+    "ĐẦU RA CẨM NANG BẮT BUỘC: MỘT block ```json chứa toàn bộ JSON GỌN ngay trong chat; KHÔNG CHÉP BASE64 DÀI VÀO CHAT. Ngoài block chỉ đính kèm các link tải link1_base64.txt, link2_base64.txt... thật.",
+    "Không dùng file .json, link Tải JSON hoàn chỉnh, Canvas hoặc artifact thay block code. Dù đã tạo file JSON, vẫn in JSON đầy đủ với HTML, nguồn, id và language; JSON-escape đúng, không rút gọn nội dung hay chèn dấu ... .",
+    'Sau khi ảnh tạo xong, dùng chương trình đọc bytes file PNG/JPEG/WebP gốc, mã hoá BASE64 và GHI FILE linkN_base64.txt thật. Mỗi TXT chỉ chứa một data:image/png;base64,... hoặc image/jpeg hay image/webp đầy đủ. Không Markdown, URL tạm, placeholder hay BASE64 viết tay.',
+    'Trong content_html dùng src="link1", src="link2"... (1–4 ảnh). Thêm image_files:[{"key":"link1","filename":"link1_base64.txt","mime":"image/webp","bytes":20392,"sha256":"64 ký tự hex thường"}]. Đây chỉ là mẫu cấu trúc: tính MIME/bytes/SHA-256 của BYTES ẢNH GỐC bằng chương trình, không sao chép số mẫu, không tính hash văn bản TXT/BASE64. Mỗi src có đúng một mục và file tương ứng, không thừa/thiếu/trùng.',
+    "Đợi tạo ảnh VÀ ghi TXT xong rồi mới xuất JSON gọn; dưới block đặt link tải thật từng linkN_base64.txt của CHÍNH CÂU TRẢ LỜI NÀY. sandbox:/mnt/data chỉ được dùng làm link tải file thật bên ngoài JSON, không dùng trong src. File ẢNH thật được đính kèm thêm. Thiếu khả năng ghi file/hash thì báo chưa hoàn tất, không bịa.",
+    "Tiện ích đọc TXT hiện tại, xác minh số bytes, SHA-256 và giải mã raster rồi thay linkN bằng data URI thật, LOẠI image_files trước POST. API không nhận trực tiếp linkN/TXT/sandbox/image_files. BASE64 thật hoặc URL HTTP(S) ảnh công khai trực tiếp từ luồng cũ vẫn tương thích. Không URL tạm hay trang HTML trong payload cuối.",
+    "Chỉ dùng handbook-image:N dự phòng khi tiện ích đã chỉ định đúng các file ảnh thật. NHẮC LẠI: JSON GỌN TRONG MỘT BLOCK CODE + các file linkN_base64.txt RIÊNG, không chép chuỗi BASE64 dài vào chat."
   ].join("\n");
 }
 
@@ -899,8 +901,8 @@ function handbookJsonAfterImagesPrompt(article, count) {
   return handbookPromptWithInlineJson([
     `Đã nhận ${count} file minh hoạ do công cụ tạo cho bài Cẩm nang id ${article.handbook_id}, language ${article.language}.`,
     "Hãy trả TOÀN BỘ JSON cuối cùng theo đúng schema trong yêu cầu trước, giữ nội dung đầy đủ. Không bịa BASE64 và không tạo lại ảnh.",
-    `Trong content_html dùng chính xác src="handbook-image:1" đến src="handbook-image:${count}" theo thứ tự các file vừa được xác nhận; đây là các mã tiện ích đã chỉ định và sẽ thay bằng bytes ảnh thật trước gửi API.`,
-    "Không trả file JSON, link tải hay tóm tắt hoàn thành. Chỉ in đầy đủ JSON trong một block code json ngay trong chat; không token hoặc revision."
+    `Dùng chương trình ghi ${count} file link1_base64.txt đến link${count}_base64.txt từ chính bytes ảnh vừa tạo; tính bytes/SHA-256, khai báo image_files và src="link1" đến src="link${count}". Đính kèm các TXT thật trong chính câu trả lời mới này, không chỉ trỏ về lượt trước.`,
+    "Không trả file JSON hay tóm tắt hoàn thành. In JSON gọn trong một block code json và đặt các link TXT thật bên dưới; không token hoặc revision, không in BASE64 dài."
   ].join("\n"));
 }
 
@@ -914,8 +916,8 @@ function jsonFormatRetryPrompt(expectedId) {
     `Hãy gửi lại TOÀN BỘ JSON cuối cùng của ${identity}, giữ nguyên đầy đủ tất cả trường và giá trị đã tạo; không rút gọn, không thêm/bớt dữ liệu${expected == null ? "." : `; trường ID phải khớp ${expected}.`}`,
     ...(expectedId?.sourceType === "doctor" ? [`Giữ id là số nguyên JSON dương và name chính xác là ${JSON.stringify(expectedId.name)}; không thay tên bác sĩ, không thêm khóa bảo mật.`] : []),
     ...(expectedId?.sourceType === "facility_image_fix" ? [`Giữ id là số nguyên JSON dương và images_revision chính xác là ${JSON.stringify(expectedId.images_revision)}; không thay revision, không tạo ảnh AI và không thêm khóa bảo mật.`] : []),
-    ...(expectedId?.sourceType === "handbook" ? [`Giữ language chính xác là ${JSON.stringify(expectedId.language)}. Không gửi lại link tải/file JSON; in toàn bộ JSON trong block code ngay trong chat, kể cả khi đã tạo file JSON ở phản hồi trước.`] : []),
-    "Chỉ xuất đúng một khối Markdown bắt đầu bằng ```json và kết thúc bằng ```; không viết giải thích ở ngoài khối.",
+    ...(expectedId?.sourceType === "handbook" ? [`Giữ language chính xác là ${JSON.stringify(expectedId.language)}. Không dùng link tải/file JSON thay block; in toàn bộ JSON gọn ngay trong chat, kể cả khi đã tạo file JSON ở phản hồi trước. Các TXT ảnh phải đính kèm lại ở dưới block.`] : []),
+    expectedId?.sourceType === "handbook" ? "Chỉ xuất một block json gọn; bên dưới đính kèm đầy đủ file linkN_base64.txt thật của lượt này và image_files có bytes/hash đúng. Không chép lại BASE64 dài, không chỉ trỏ đến file của lượt trước." : "Chỉ xuất đúng một khối Markdown bắt đầu bằng ```json và kết thúc bằng ```; không viết giải thích ở ngoài khối.",
     "Đảm bảo nội dung bên trong là JSON hợp lệ, mọi dấu ngoặc kép trong chuỗi đều được escape đúng chuẩn JSON."
   ].join("\n");
   return expectedId?.sourceType === "handbook" ? handbookPromptWithInlineJson(prompt) : prompt;
@@ -2091,7 +2093,7 @@ function assistantResponseSnapshot(node, count = 1, expectedId) {
       const text = String(blocks[index].textContent || "").trim();
       if (!text) continue;
       const parsed = parseAssistantResponse({ sources: [text] }, expectedId);
-      if (parsed?.idMatched) return { ...assistantResponseIdentity(node, count), sources: [text], signature: text };
+      if (parsed?.idMatched) return { ...assistantResponseIdentity(node, count), sources: [text], signature: text + (expectedId?.sourceType === "handbook" ? "\u0000" + (globalThis.MedReviewHandbookFiles?.signature(node) || "") : "") };
     }
     const text = String(node.textContent || "").trim();
     add(text);
@@ -2109,7 +2111,7 @@ function assistantResponseSnapshot(node, count = 1, expectedId) {
     add(node.textContent);
     add(node.innerText);
   }
-  return { ...assistantResponseIdentity(node, count), sources, signature: sources.length === 1 ? sources[0] : sources.join("\u0000") };
+  return { ...assistantResponseIdentity(node, count), sources, signature: (sources.length === 1 ? sources[0] : sources.join("\u0000")) + (expectedId?.sourceType === "handbook" ? "\u0000" + (globalThis.MedReviewHandbookFiles?.signature(node) || "") : "") };
 }
 
 function geminiResponseNodesForRecovery() {
@@ -2181,7 +2183,17 @@ function freshHandbookImages(previous) {
     !previous.nodes?.has(image.node) && imageLooksLikeGeneratedAsset(image.image));
 }
 
-async function prepareHandbookOutput(article, data, previous) {
+async function prepareHandbookOutput(article, data, previous, responseSnapshot = null) {
+  MedReviewHandbook.validate(article, data, { allowPlaceholders: true, allowFileRefs: true });
+  if (globalThis.MedReviewHandbookFiles?.hasReferences(data)) {
+    reportSystemPhase(article.id, article.runToken, "reading-image-files", "Đang đọc file TXT của đúng câu trả lời này, đối chiếu bytes/SHA-256 và kiểm tra ảnh thật trước gửi web.");
+    const controller = new AbortController();
+    const cancellation = setInterval(() => { if (cancelledArticleId === article.id) controller.abort(); }, 200);
+    try {
+      if (cancelledArticleId === article.id) controller.abort();
+      data = await MedReviewHandbookFiles.resolve(data, { node: responseSnapshot?.node, provider: PROVIDER, signal: controller.signal });
+    } finally { clearInterval(cancellation); }
+  }
   MedReviewHandbook.validate(article, data, { allowPlaceholders: true });
   const tags = MedReviewHandbook.imageTags(data.content_html);
   const placeholders = tags.filter((image) => /^handbook-image:[1-4]$/.test(image.uri));
@@ -2511,9 +2523,11 @@ async function waitForResponse(previous, articleId, timeout = ARTICLE_WAIT_TIMEO
       parsedChangedAt = Date.now();
       continue;
     }
+    let imageFollowupPending = false;
     if (imagePrevious) {
       const currentImages = latestGeneratedImages();
       const freshImages = currentImages.images.filter((image) => !imagePrevious.keys.has(image.key));
+      imageFollowupPending = handbookTurn && freshImages.length > 0;
       const ready = (entry) => entry.image?.complete !== false && entry.image?.naturalWidth > 0 && entry.image?.naturalHeight > 0;
       const imageSignature = handbookTurn ? currentImages.signature + '|' + freshImages.map(entry => `${ready(entry)}:${entry.image?.naturalWidth}:${entry.image?.naturalHeight}`).join('|') : currentImages.signature;
       if (imageSignature !== imageLast) {
@@ -2526,7 +2540,14 @@ async function waitForResponse(previous, articleId, timeout = ARTICLE_WAIT_TIMEO
         // A direct image may arrive without a JSON planning response. Wait
         // until its card has settled. `completeGeneratedImage` then fetches
         // the authenticated Blob and uploads it as a real file.
-        if (!isGenerating() && Date.now() - imageChangedAt >= 3200) {
+        // A finished JSON + TXT reply wins over its illustrative image card.
+        // Leave time for tool/file cards to render before asking another turn.
+        const finalSnapshot = handbookTurn ? latestAssistantResponse(expectedId) : null;
+        const finalIsCurrent = finalSnapshot?.node && (options.acceptCurrent || !previous.node ||
+          (finalSnapshot.id && previous.id ? finalSnapshot.id !== previous.id : finalSnapshot.node !== previous.node || finalSnapshot.count > previous.count) ||
+          (["grok", "claude", "gemini"].includes(PROVIDER) && finalSnapshot.signature !== previous.signature));
+        const finalJson = finalIsCurrent ? parseAssistantResponse(finalSnapshot, expectedId) : null;
+        if (!isGenerating() && !finalJson?.idMatched && Date.now() - imageChangedAt >= (handbookTurn ? 15000 : 3200)) {
           return {
             directImage: { ...freshImage, rawResponse: imageRawResponse },
             rawResponse: imageRawResponse
@@ -2604,7 +2625,16 @@ async function waitForResponse(previous, articleId, timeout = ARTICLE_WAIT_TIMEO
       parsedSourceResult = parseAssistantResponse(now, expectedId);
       parsedValueReference = null;
     }
-    const parsed = parsedSourceResult;
+    let parsed = parsedSourceResult;
+    if (handbookTurn && parsed?.idMatched && (Object.hasOwn(parsed.data || {}, "image_files") || /(?:^|\s)src\s*=\s*["']link[1-4]["']/i.test(parsed.data?.content_html || "")) &&
+        !globalThis.MedReviewHandbookFiles?.ready(parsed.data, now.node)) {
+      // Missing/unfinished files are not a completed payload. Request the
+      // compact JSON and actual files together once, then fail without POST.
+      if (formatRetrySent && !generating && Date.now() - changedAt >= 15000) {
+        throw new Error("Cẩm nang vẫn thiếu file linkN_base64.txt hoặc image_files không khớp. Cần JSON và file TXT thật trong cùng câu trả lời; chưa gửi web.");
+      }
+      parsed = null;
+    }
     // Require the parsed JSON to match expectedId if specified, so reload or
     // multi-turn chat history never finishes the job with an older facility.
     const idMatched = Boolean(parsed?.idMatched);
@@ -2680,12 +2710,13 @@ async function waitForResponse(previous, articleId, timeout = ARTICLE_WAIT_TIMEO
           }
         }
         clearJsonFormatRetryState(articleId, options.runToken);
-        return parsed;
+        return handbookTurn ? { ...parsed, responseSnapshot: now } : parsed;
       }
       continue;
     }
     // Give the original response a chance to finish before sending the one
     // formatting follow-up; keep waiting while the provider is still generating.
+    if (imageFollowupPending && !parsedSourceResult?.idMatched) continue;
     const completedMalformed = !generating && Date.now() - changedAt >= 15000;
     if (!formatRetrySent && candidateAvailable && completedMalformed && rawResponse) {
       try {

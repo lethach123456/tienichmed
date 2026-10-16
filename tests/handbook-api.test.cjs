@@ -73,6 +73,16 @@ test("handbook accepts mixed real BASE64 and public image links without changing
     assert.equal(H.imageHttpUrl(url), true, url);
   }
 });
+test("file manifest is browser-only and unresolved compact output never reaches POST", async () => {
+  const ctx = load();
+  const compact = result({ content_html: '<img src="link1">', image_files: [{ key: 'link1', filename: 'link1_base64.txt' }] });
+  assert.equal(ctx.H.validate(job(), compact, { allowFileRefs: true }).length, 1);
+  assert.throws(() => ctx.H.validate(job(), compact), /image_files/);
+  assert.throws(() => ctx.H.payload(job(), result({ image_files: [] })), /image_files/);
+  const saved = await ctx.api.handleArticleComplete({ articleId: job().id, runToken: "run-one", article: compact }, ctx.sender);
+  assert.equal(saved.updated, false);
+  assert.equal(ctx.calls.length, 0);
+});
 test("handbook rejects unsafe private, temporary and placeholder image links before POST", async () => {
   const bad = ["http://localhost/a.png", "http://foo.localhost/a.png", "http://clinic.internal/a.png", "http://clinic.home/a.png", "http://clinic.lan/a.png",
     "http://127.0.0.1/a.png", "http://10.0.0.1/a.png", "http://192.168.1.1/a.png", "http://172.16.0.1/a.png", "http://169.254.169.254/a.png", "http://100.64.0.1/a.png",

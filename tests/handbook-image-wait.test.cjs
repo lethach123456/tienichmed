@@ -53,7 +53,7 @@ function harness(onTick = () => {}) {
     fill: (_input, prompt) => state.fills.push({ time: state.time, prompt }),
     send: async () => { state.sends.push(state.time); return true; }, sendReady: () => ({}) };
   context.probe.configure(config);
-  return { api: context.probe, state, config };
+  return { api: context.probe, state, config, context };
 }
 const expected = { sourceType: 'handbook', id: 32, language: 'vi' };
 const baseline = { node: null, id: '', count: 0, signature: '', sources: [] };
@@ -61,7 +61,7 @@ const imageBaseline = { signature: '', images: [], keys: new Set() };
 
 test('handbook waits beyond 15s for image generation and loaded final pixels, without typing JSON retry', async () => {
   const h = harness(s => { s.busy = s.time < 24000; s.image = s.time >= 24000; s.loaded = s.time >= 28800; });
-  const result = await h.api.waitForResponse(baseline, 'handbook-32', 45000, expected, { imagePrevious: imageBaseline });
+  const result = await h.api.waitForResponse(baseline, 'handbook-32', 60000, expected, { imagePrevious: imageBaseline });
   assert.ok(result.directImage);
   assert.ok(h.state.time >= 28800);
   assert.equal(h.state.reads.some(time => time < 24000), false, 'do not parse the unfinished answer while tool controls remain active');
@@ -71,7 +71,7 @@ test('handbook waits beyond 15s for image generation and loaded final pixels, wi
 
 test('one missing progress poll during long image generation never triggers malformed JSON retry', async () => {
   const h = harness(s => { s.busy = s.time < 24000; s.gap = s.time === 16800; s.image = s.loaded = s.time >= 24000; });
-  const result = await h.api.waitForResponse(baseline, 'handbook-32', 45000, expected, { imagePrevious: imageBaseline });
+  const result = await h.api.waitForResponse(baseline, 'handbook-32', 60000, expected, { imagePrevious: imageBaseline });
   assert.ok(result.directImage);
   assert.deepEqual(h.state.fills, []);
   assert.deepEqual(h.state.sends, []);
@@ -92,7 +92,7 @@ test('a ready first illustration does not finish the turn while a second fresh i
   h.api.configure({ ...h.config, images: () => ({ signature: 'two-images', images: [
     { key: 'first', image: loaded }, { key: 'second', image: loading }
   ] }) });
-  const result = await h.api.waitForResponse(baseline, 'handbook-32', 45000, expected, { imagePrevious: imageBaseline });
+  const result = await h.api.waitForResponse(baseline, 'handbook-32', 60000, expected, { imagePrevious: imageBaseline });
   assert.equal(result.directImage.key, 'second');
   assert.ok(h.state.time >= 35200, 'all final image bytes settle before requesting JSON');
   assert.deepEqual(h.state.fills, []);
@@ -132,7 +132,7 @@ test('download-only reply gets one formatting retry, then accepts corrected inli
     parse: (snapshot, id) => h.api.parseOriginal(snapshot, id),
     retry: async (_articleId, id) => {
       const prompt = h.api.jsonFormatRetryPrompt(id);
-      assert.match(prompt, /Không gửi lại link tải\/file JSON/);
+      assert.match(prompt, /Không dùng link tải\/file JSON thay block/);
       h.state.retries.push(h.state.time); h.state.json = true;
       return { id: 'download', count: 1, signatureHash: 'old' };
     }
@@ -141,6 +141,52 @@ test('download-only reply gets one formatting retry, then accepts corrected inli
   assert.deepEqual(JSON.parse(JSON.stringify(result.data)), corrected);
   assert.equal(h.state.retries.length, 1);
   assert.ok(h.state.retries[0] >= 15000);
+});
+
+test('final matching JSON wins over an already loaded generated illustration', async () => {
+  const h = harness(s => { s.busy = false; s.image = s.loaded = s.json = true; });
+  const result = await h.api.waitForResponse(baseline, 'handbook-32', 45000, expected, { imagePrevious: imageBaseline });
+  assert.equal(result.data.id, 32);
+  assert.equal(result.directImage, undefined);
+  assert.equal(result.responseSnapshot.id, 'final');
+  assert.deepEqual(h.state.sends, []);
+});
+
+test('same-ID JSON from the previous turn does not suppress new-image handling', async () => {
+  const h = harness(s => { s.busy = false; s.image = s.loaded = true; });
+  const old = { node: {}, id: 'old', count: 1, signature: 'old-json', sources: ['old-json'] };
+  h.api.configure({ ...h.config, snapshot: () => old, parse: () => ({ idMatched: true, data: { id: 32 } }) });
+  const result = await h.api.waitForResponse(old, 'handbook-32', 45000, expected, { imagePrevious: imageBaseline });
+  assert.ok(result.directImage);
+  assert.deepEqual(h.state.sends, []);
+});
+
+test('compact JSON waits for attachments in its own response snapshot', async () => {
+  const h = harness(s => { s.busy = false; s.json = true; });
+  const node = {};
+  const compact = { id: 32, language: 'vi', content_html: '<img src="link1">', image_files: [{ key: 'link1' }] };
+  h.context.MedReviewHandbookFiles = { ready(data, scope) { assert.equal(data.id, 32); assert.equal(scope, node); return h.state.time >= 12000; } };
+  h.api.configure({ ...h.config,
+    snapshot: () => ({ node, id: 'final', count: 2, signature: h.state.time < 12000 ? 'json-files-pending' : 'json-files-ready', sources: ['compact-json'] }),
+    parse: () => ({ idMatched: true, data: compact })
+  });
+  const result = await h.api.waitForResponse(baseline, 'handbook-32', 45000, expected);
+  assert.equal(result.responseSnapshot.node, node);
+  assert.ok(h.state.time >= 15200);
+  assert.deepEqual(h.state.sends, []);
+});
+
+test('missing attachments get one reattachment request then fail without returning a payload', async () => {
+  const h = harness(s => { s.busy = false; s.json = true; });
+  const compact = { id: 32, language: 'vi', content_html: '<img src="link1">', image_files: [{ key: 'link1' }] };
+  h.context.MedReviewHandbookFiles = { ready: () => false };
+  h.api.configure({ ...h.config,
+    snapshot: () => ({ node: {}, id: h.state.retries.length ? 'retry' : 'final', count: h.state.retries.length + 1, signature: h.state.retries.length ? 'retry-json' : 'first-json', sources: ['compact-json'] }),
+    parse: () => ({ idMatched: true, data: compact }),
+    retry: async () => { h.state.retries.push(h.state.time); return { id: 'final', count: 1, signatureHash: 'old' }; }
+  });
+  await assert.rejects(h.api.waitForResponse(baseline, 'handbook-32', 60000, expected), /thiếu file/);
+  assert.equal(h.state.retries.length, 1);
 });
 
 test('format follow-up watches Send readiness instead of failing while the composer is disabled', async () => {

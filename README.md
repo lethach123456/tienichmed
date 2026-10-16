@@ -1,6 +1,6 @@
 # MedReview AI content
 
-Chrome Extension (Manifest V3), phiên bản 1.6.6, để quản lý hàng đợi bài viết, hồ sơ bác sĩ, Toplist, dịch Việt → Anh, tạo ảnh AI và kiểm tra/sửa ảnh thật của cơ sở; tiện ích nhập prompt vào ChatGPT/Grok/Claude/Gemini đang mở, đọc JSON phản hồi và lưu lại trong tiện ích.
+Chrome Extension (Manifest V3), phiên bản 1.6.8, để quản lý hàng đợi bài viết, hồ sơ bác sĩ, Toplist, dịch Việt → Anh, tạo ảnh AI và kiểm tra/sửa ảnh thật của cơ sở; tiện ích nhập prompt vào ChatGPT/Grok/Claude/Gemini đang mở, đọc JSON phản hồi và lưu lại trong tiện ích.
 
 Panel làm việc xuất hiện ở mép phải trên `chatgpt.com`, `grok.com`, `claude.ai` và `gemini.google.com`. Panel tự nhận diện AI theo URL và có một nút **Chạy/Dừng**: bấm trong tab nào thì chỉ tab đó nhận bài. Có thể chạy nhiều tab của cùng một AI hoặc các AI khác nhau song song; mỗi bài được khóa theo tab nên không bị nhận trùng.
 
@@ -40,6 +40,14 @@ Trong **Cài đặt** (⚙), có URL riêng cho **Cơ sở y tế**, **Viết h�
 - Lấy prompt/lưu bản dịch: `https://medreview.vn/api/medical/translate-content.php`
 
 Các API dùng header `X-Medical-Api-Key` lấy từ file cấu hình riêng `api-key.local.js` của bản cài (file này bị Git bỏ qua; không đưa khóa vào prompt hoặc mã phát hành). Worker dùng chế độ classic để nạp cấu hình này bằng `importScripts`. Chọn **Toplist** tại **Nguồn lấy bài** để tải danh sách. Các nguồn thông thường lấy một bài mỗi lần; nguồn bác sĩ lấy lô tối đa 25 bản ghi theo cấu hình để bỏ qua bác sĩ đang được phiên khác giữ khóa, nhưng mỗi tab vẫn chỉ viết một bác sĩ tại một thời điểm. Sau khi bài được lưu thành công, tab nghỉ 60 giây rồi xử lý bài tiếp theo. Bài lỗi không làm extension tải tiếp lô mới. Extension dùng nguyên `prompt` từ API. Các bài đã tải từ trước vẫn nằm trong hàng đợi, và mỗi bài giữ loại riêng để tự gửi về đúng API kể cả khi bấm **Gửi lại** hoặc đổi nguồn tải bài. URL đã lưu trước đây trên `top.top` hoặc `xxhihi.site` sẽ tự chuyển sang `medreview.vn` khi extension khởi động.
+
+## Cẩm nang: JSON gọn và file ảnh riêng
+
+AI trả một block `json` đầy đủ bài với `img src="link1"`, `link2`… và `image_files` gồm `key`, `filename`, `mime`, `bytes`, `sha256`. Ngay dưới block đính kèm các file thật `link1_base64.txt`, `link2_base64.txt`…; mỗi TXT chỉ chứa một data URI PNG/JPEG/WebP mã hoá từ bytes ảnh gốc bằng chương trình. Không in chuỗi BASE64 dài vào chat. Hash và số bytes tính trên ảnh gốc, không phải văn bản TXT.
+
+Tiện ích đợi công cụ tạo ảnh và file hoàn tất, chỉ đọc file trong chính câu trả lời chứa JSON, kiểm tra bytes/SHA-256 và giải mã raster. Sau đó thay mã ảnh bằng BASE64 thật, bỏ `image_files` rồi gửi API hiện tại. BASE64 thật/URL ảnh công khai từ luồng cũ vẫn tương thích. Không gửi `linkN`, TXT hay sandbox trực tiếp lên API; thiếu/hỏng file thì dừng trước POST, không lấy ảnh của lượt khác. Trên ChatGPT, nếu thẻ file không có URL tải trực tiếp, tiện ích mở bản xem trước TXT đúng tên rồi tự đóng; hãy đóng trình xem file khác đang mở trước khi chạy. Provider không cung cấp link/thẻ file đọc được sẽ báo lỗi khả năng thay vì tự bịa ảnh.
+
+Sau khi cập nhật, Reload tiện ích trong `chrome://extensions`, tải lại tab AI và lấy prompt Cẩm nang mới. Không gỡ cài đặt/xoá dữ liệu hàng đợi.
 
 ## Viết hồ sơ bác sĩ
 

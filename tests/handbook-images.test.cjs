@@ -10,9 +10,15 @@ const article = { id: 'handbook-9', sourceType: 'handbook', handbook_id: 9, lang
 const result = html => ({ id: 9, language: 'vi', title: 'Chủ đề', excerpt: 'Tóm tắt', seo_title: 'Chủ đề', seo_description: 'Mô tả',
   content_html: html, sources_json: [{ url: 'https://www.who.int/health-topics', title: 'Nguồn chính thức' }] });
 
-function load({ decode = true } = {}) {
-  const fetched = [], generated = [];
-  const context = vm.createContext({ URL, Blob, atob, setTimeout, clearTimeout,
+function load({ decode = true, files = false } = {}) {
+  const fetched = [], generated = [], resolvedFiles = [];
+  const context = vm.createContext({ URL, Blob, atob, AbortController, setTimeout, clearTimeout, setInterval, clearInterval,
+    ...(files ? { MedReviewHandbookFiles: { hasReferences: data => 'image_files' in data, async resolve(data, options) {
+      resolvedFiles.push(options);
+      const result = { ...data, content_html: data.content_html.replace('src="link1"', `src="${png}"`) };
+      delete result.image_files;
+      return result;
+    } } } : {}),
     location: { hostname: 'chatgpt.com', pathname: '/' },
     chrome: { runtime: { onMessage: { addListener() {} }, async sendMessage() { return { ok: true }; } } },
     document: { querySelector: () => null, querySelectorAll: () => [] },
@@ -38,8 +44,22 @@ function load({ decode = true } = {}) {
     generated.push(image.url);
     return { blob: new Blob([Buffer.from(png.split(',')[1], 'base64')], { type: 'image/png' }), mimeType: 'image/png' };
   });
-  return { api: context.probe, fetched, generated };
+  return { api: context.probe, fetched, generated, resolvedFiles };
 }
+
+test('handbook preparation passes matching response scope and cancellation into file resolver, then final-validates resolved output', async () => {
+  const ctx = load({ files: true });
+  const node = {};
+  const original = { ...result('<img src="link1"><img src="https://images.example.org/direct.webp">'), image_files: [{ key: 'link1' }] };
+  const prepared = await ctx.api.prepareHandbookOutput(article, original, null, { node });
+  assert.equal(ctx.resolvedFiles.length, 1);
+  assert.equal(ctx.resolvedFiles[0].node, node);
+  assert.equal(ctx.resolvedFiles[0].provider, 'chatgpt');
+  assert.equal(ctx.resolvedFiles[0].signal.aborted, false);
+  assert.equal('image_files' in prepared, false);
+  assert.equal(prepared.content_html, original.content_html.replace('src="link1"', `src="${png}"`));
+  assert.deepEqual(ctx.fetched, [png]);
+});
 
 test('mixed handbook output pixel-decodes only BASE64 and leaves public URL untouched for API', async () => {
   const ctx = load();
