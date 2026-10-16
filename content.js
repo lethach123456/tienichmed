@@ -883,7 +883,8 @@ function handbookInlineJsonRules() {
     "ĐẦU RA CẨM NANG BẮT BUỘC: khi hoàn tất, in TOÀN BỘ JSON trực tiếp trong chat, trong ĐÚNG MỘT block code mở bằng ```json và đóng bằng ```; không giải thích bên ngoài block.",
     "Không dùng file .json, link Tải JSON hoàn chỉnh, sandbox:/mnt/data, Canvas hoặc artifact thay cho block code. Dù đã tạo file JSON để kiểm tra, vẫn phải in JSON đầy đủ ngay trong chat; tiện ích không đọc link tải file.",
     "Giữ đầy đủ HTML, nguồn, id và language; JSON-escape đúng dấu nháy/xuống dòng. Không chia block, không rút gọn nội dung/BASE64, không chèn dấu ... hay bịa bytes ảnh để đủ định dạng.",
-    "Yêu cầu đối với ảnh trong payload cuối gửi API: Ảnh Cẩm nang phải là file PNG/JPEG/WebP thật đã mã hoá BASE64 đầy đủ, không URL tạm/placeholder.",
+    "Hợp đồng ảnh Cẩm nang hiện hành cho phép cùng bài dùng cả hai dạng: file PNG/JPEG/WebP thật đã mã hoá BASE64 đầy đủ HOẶC link HTTP(S) công khai trực tiếp tới file PNG/JPEG/WebP thật. Không URL tạm, blob:, sandbox:, trang xem ảnh, link có token hay placeholder; không bịa hoặc cắt BASE64. Quy tắc này thay thế hướng dẫn chỉ nhận BASE64 nếu prompt cũ còn ghi như vậy.",
+    "Trong content_html đặt mỗi ảnh trong img src bằng BASE64 thật hoặc link ảnh công khai trực tiếp; không tự đổi link thành BASE64 giả. API sẽ tải, kiểm tra, nén và lưu cả hai dạng ảnh trên hosting, rồi thay src bằng URL nội bộ.",
     "File ẢNH thật từ công cụ tạo ảnh vẫn được phép đính kèm. Chỉ dùng handbook-image:N khi tiện ích đã xác nhận và chỉ định các file ảnh thật đó; tiện ích sẽ thay bằng BASE64 thật trước gửi API. Không tự tạo mã ảnh khi chưa được chỉ định.",
     "Nếu chưa thể xuất đầy đủ hoặc chưa có ảnh thật, báo rõ chưa hoàn tất, không báo thành công giả. Khi hoàn tất: CHỈ MỘT BLOCK ```json CHỨA TOÀN BỘ JSON NGAY TRONG CHAT."
   ].join("\n");
@@ -2186,7 +2187,9 @@ async function prepareHandbookOutput(article, data, previous) {
   const placeholders = tags.filter((image) => /^handbook-image:[1-4]$/.test(image.uri));
   if (!placeholders.length) {
     // Pixel decoding rejects syntactically valid but fabricated/truncated data.
-    if (typeof createImageBitmap === "function") for (const image of tags) {
+    // Public HTTP(S) links are deliberately not fetched from this AI tab. The
+    // API performs SSRF-safe downloads and raster validation on the hosting.
+    if (typeof createImageBitmap === "function") for (const image of tags.filter((tag) => /^data:image\//i.test(tag.uri))) {
       const response = await fetch(image.uri);
       const bitmap = await createImageBitmap(await response.blob()).catch(() => null);
       if (!bitmap || !bitmap.width || !bitmap.height || bitmap.width * bitmap.height > 12000000 || Math.max(bitmap.width, bitmap.height) > 8192) {
@@ -2198,7 +2201,7 @@ async function prepareHandbookOutput(article, data, previous) {
     return data;
   }
   if (!["chatgpt", "grok"].includes(PROVIDER) || !previous) {
-    throw MedReviewHandbook.error("handbook_capability_error", "Chưa lấy được bytes ảnh minh hoạ thật từ provider/lượt này. Cần JSON có data ảnh thật hoặc tạo lại bằng ChatGPT/Grok; không dùng ảnh cũ hay fake BASE64.");
+    throw MedReviewHandbook.error("handbook_capability_error", "Chưa lấy được bytes ảnh minh hoạ thật từ provider/lượt này. Cần JSON có data ảnh thật hoặc link ảnh công khai trực tiếp, hoặc tạo lại bằng ChatGPT/Grok; không dùng ảnh cũ hay fake BASE64.");
   }
   reportSystemPhase(article.id, article.runToken, "attaching-images", "Đang tải file minh hoạ mới của chính bài này, kiểm tra và gắn BASE64 vào HTML.");
   const images = previous.bound || freshHandbookImages(previous);
@@ -2220,7 +2223,7 @@ async function prepareHandbookOutput(article, data, previous) {
     });
     MedReviewHandbook.imageData(dataUrl);
     for (const image of placeholders.filter((tag) => tag.uri === `handbook-image:${slot}`)) {
-      html = html.replace(image.tag, image.tag.replace(/(\bsrc\s*=\s*)(["'])(.*?)\2/is, (_match, prefix, quote) => `${prefix}${quote}${dataUrl}${quote}`));
+      html = html.replace(image.tag, image.tag.replace(/((?:^|\s)src\s*=\s*)(["'])(.*?)\2/is, (_match, prefix, quote) => `${prefix}${quote}${dataUrl}${quote}`));
     }
   }
   const result = { ...data, content_html: html };

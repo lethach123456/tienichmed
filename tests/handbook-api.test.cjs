@@ -54,13 +54,53 @@ test("handbook validates real image format, identity, MIME and all contract size
   const { H } = load();
   assert.equal(H.validate(job(), result()).length, 1);
   for (const value of [{ id: "9" }, { id: 8 }, { language: "en" }, { status: "published" }, { claim_token: token }, { sources_json: [] }, { sources_json: [{ url: "https://who.int/?token=secret", title: "x" }] },
-    { content_html: "<p>No image</p>" }, { content_html: '<img src="https://private.grok.com/x.png">' }, { content_html: `<img src="${png.replace("image/png", "image/jpeg")}">` },
+    { content_html: "<p>No image</p>" }, { content_html: '<img src="http://127.0.0.1/x.png">' }, { content_html: `<img src="${png.replace("image/png", "image/jpeg")}">` },
     { content_html: '<img src="data:image/png;base64,ZmFrZQ==">' }, { content_html: `<script>x</script><img src="${png}">` }, { content_html: `<img src="${png}">`.repeat(5) }]) {
     assert.throws(() => H.validate(job(), result(value)), (err) => err?.handbookError === true);
   }
   assert.throws(() => H.imageData("data:image/png;base64," + "A".repeat(4 * Math.ceil((H.limits.imageBytes + 1) / 3))), /5 MiB/);
   assert.equal(H.validate(job(), result({ content_html: '<h2>x</h2><img src="handbook-image:1">' }), { allowPlaceholders: true }).length, 1);
   assert.throws(() => H.validate(job(), result({ content_html: '<img src="handbook-image:1">' })), /ảnh|Ảnh/);
+  assert.throws(() => H.validate(job(), result({ content_html: `<img data-src="${png}" src="http://127.0.0.1/private.png">` })), /URL/);
+  assert.throws(() => H.validate(job(), result({ content_html: `<img data-src="${png}">` })), /src/);
+});
+test("handbook accepts mixed real BASE64 and public image links without changing their bytes", () => {
+  const { H } = load();
+  const original = result({ content_html: `<h2>Minh hoạ</h2><img src="${png}"><img src="https://cdn.example.org/illustration?w=1280&amp;format=webp">` });
+  assert.equal(H.validate(job(), original).length, 2);
+  assert.equal(H.payload(job(), original).content_html, original.content_html);
+  for (const url of ["https://cdn.example.org/illustration", "https://8.8.8.8/image.png", "http://images.example.org:80/photo.jpg", "https://xn--bcher-kva.example.org:443/photo.webp"]) {
+    assert.equal(H.imageHttpUrl(url), true, url);
+  }
+});
+test("handbook rejects unsafe private, temporary and placeholder image links before POST", async () => {
+  const bad = ["http://localhost/a.png", "http://foo.localhost/a.png", "http://clinic.internal/a.png", "http://clinic.home/a.png", "http://clinic.lan/a.png",
+    "http://127.0.0.1/a.png", "http://10.0.0.1/a.png", "http://192.168.1.1/a.png", "http://172.16.0.1/a.png", "http://169.254.169.254/a.png", "http://100.64.0.1/a.png",
+    "http://0.0.0.0/a.png", "http://192.0.2.1/a.png", "http://198.18.0.1/a.png", "http://198.51.100.1/a.png", "http://203.0.113.1/a.png", "http://224.0.0.1/a.png",
+    "http://2130706433/a.png", "http://0177.0.0.1/a.png", "http://0x7f000001/a.png", "http://0x08080808/a.png",
+    "http://[::1]/a.png", "http://[::ffff:127.0.0.1]/a.png", "http://[::ffff:7f00:1]/a.png", "http://[fc00::1]/a.png", "http://[fe80::1]/a.png",
+    "https://user:pass@images.example.org/a.png", "https://images.example.org:8080/a.png", "http://images.example.org:443/a.png", "https://images.example.org:80/a.png",
+    "https://images.example.org/a.png#fragment", "https://images.example.org/a.png?token=private", "https://images.example.org/a.png?api-key=private", "https://images.example.org/a.png?%61uth=private",
+    "https://images.example.org/a.png?x=1&amp;access_token=private", "https://images.example.org/a.png?secret=private", "https://images.example.org/a.png?signature=private",
+    "https://images.example.org/%0da.png", "https://images.example.org/%5ca.png", "https://images.example.org/\\a.png", "https://images.example.org/\na.png",
+    "blob:https://example.org/file", "sandbox:/mnt/data/image.png", "/image.png", "https://placehold.co/100x100.png", "https://images.example.org/placeholder.png"];
+  for (const url of bad) {
+    const ctx = load();
+    assert.equal(ctx.H.imageHttpUrl(url), false, url);
+    const saved = await ctx.api.handleArticleComplete({ articleId: job().id, runToken: "run-one", article: result({ content_html: `<img src='${url}'>` }) }, ctx.sender);
+    assert.equal(saved.updated, false, url);
+    assert.equal(ctx.calls.length, 0, `${url} not sent`);
+  }
+});
+test("handbook completion POST passes mixed BASE64 and public URLs only to receiving API", async () => {
+  const ctx = load();
+  const original = result({ content_html: `<h2>Minh hoạ</h2><img src="${png}"><img src="https://images.example.org/illustration.webp">` });
+  const saved = await ctx.api.handleArticleComplete({ articleId: job().id, runToken: "run-one", article: original }, ctx.sender);
+  assert.equal(saved.updated, true);
+  const updates = ctx.calls.filter((call) => call.url === UPDATE);
+  assert.equal(updates.length, 1);
+  assert.equal(updates[0].body.content_html, original.content_html);
+  assert.ok(ctx.calls.every((call) => call.url === UPDATE || call.url === QUEUE));
 });
 test("handbook queue preserves each server prompt and uses a separate scoped source", async () => {
   const ctx = load({ items: [], runner: { active: false } });

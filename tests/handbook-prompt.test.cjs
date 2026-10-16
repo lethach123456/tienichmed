@@ -26,7 +26,7 @@ function repeatedContract(api, prompt) {
   assert.ok(prompt.startsWith(rules), 'inline contract leads the prompt');
   assert.ok(prompt.endsWith(rules), 'inline contract closes the prompt');
   for (const literal of ['```json', 'file .json', 'Tải JSON hoàn chỉnh', 'sandbox:/mnt/data', 'Canvas', 'artifact', 'File ẢNH thật', 'không rút gọn nội dung/BASE64',
-    'Ảnh Cẩm nang phải là file PNG/JPEG/WebP thật đã mã hoá BASE64 đầy đủ, không URL tạm/placeholder.']) {
+    'BASE64 đầy đủ HOẶC link HTTP(S) công khai trực tiếp', 'API sẽ tải, kiểm tra, nén và lưu cả hai dạng ảnh trên hosting']) {
     assert.ok(rules.includes(literal), `contract includes ${literal}`);
   }
 }

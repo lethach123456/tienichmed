@@ -13,9 +13,41 @@
         ![...url.searchParams.keys()].some((key) => /^(?:token|api[_-]?key|access[_-]?token|signature|auth)$/i.test(key));
     } catch { return false; }
   }
+  // Shape checks only. Never fetch arbitrary remote illustrations from a
+  // provider tab: the receiver resolves/pins public DNS and validates bytes.
+  function imageHttpUrl(value) {
+    if (typeof value !== "string" || !value || value.length > 8000 ||
+        /[\s\u0000-\u001f\u007f\\<>"']|%(?:0[0-9a-f]|1[0-9a-f]|7f|5c)/i.test(value)) return false;
+    const source = value.replace(/&(?:amp|#0*38|#x0*26);/gi, "&");
+    if (!httpUrl(source) || source.includes("#")) return false;
+    let url;
+    try { url = new URL(source); } catch { return false; }
+    if (url.port) return false; // WHATWG strips only the protocol's default port.
+    const host = url.hostname.toLowerCase().replace(/\.$/, "");
+    const authority = source.match(/^https?:\/\/([^/?#]+)/i)?.[1] || "";
+    const rawHost = authority.replace(/:\d+$/, "").toLowerCase();
+    // Literal IPv6 is conservatively left unsupported in the browser, including
+    // mapped private IPv4. Normal public hostnames may still resolve to IPv6.
+    if (!host.includes(".") || host.includes(":") || rawHost.includes("%") ||
+        !/^[a-z0-9.-]+$/i.test(rawHost) ||
+        /(?:^|\.)(?:localhost|local|internal|home|lan|test|invalid)$/.test(host) ||
+        host.split(".").some((label) => !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label))) return false;
+    if (/^\d+(?:\.\d+){3}$/.test(host)) {
+      if (rawHost !== host) return false; // Reject decimal/octal/hex IP spellings.
+      const [a, b, c] = host.split(".").map(Number);
+      if ([0, 10, 127].includes(a) || a >= 224 || a === 100 && b >= 64 && b <= 127 ||
+          a === 169 && b === 254 || a === 172 && b >= 16 && b <= 31 ||
+          a === 192 && (b === 0 && [0, 2].includes(c) || b === 88 && c === 99 || b === 168) ||
+          a === 198 && (b === 18 || b === 19 || b === 51 && c === 100) || a === 203 && b === 0 && c === 113) return false;
+    }
+    if ([...url.searchParams.keys()].some((key) => /^(?:key|api[_-]?key|access[_-]?token|auth[_-]?token|token|secret|password|auth|authorization|signature)$/i.test(key))) return false;
+    if (/(?:^|\.)(?:placeholder\.com|placehold\.co|placehold\.it|dummyimage\.com)$/.test(host) ||
+        /(?:^|[\/_-])placeholder(?:[\/_.-]|$)/i.test(url.pathname)) return false;
+    return true;
+  }
   function imageData(uri) {
     const match = typeof uri === "string" && uri.match(/^data:image\/(png|jpeg|webp);base64,([A-Za-z0-9+/]+={0,2})$/);
-    if (!match || match[2].length % 4) throw error("missing_images", "Ảnh Cẩm nang phải là file PNG/JPEG/WebP thật đã mã hoá BASE64 đầy đủ, không URL tạm/placeholder.");
+    if (!match || match[2].length % 4) throw error("missing_images", "Ảnh Cẩm nang cần PNG/JPEG/WebP BASE64 đầy đủ hoặc URL HTTP(S) ảnh công khai trực tiếp; không URL tạm/placeholder.");
     const length = match[2].length * 3 / 4 - (match[2].endsWith("==") ? 2 : match[2].endsWith("=") ? 1 : 0);
     if (!length || length > limits.imageBytes) throw error("image_too_large", "Mỗi ảnh Cẩm nang tối đa 5 MiB sau giải mã.");
     let header;
@@ -27,7 +59,7 @@
   }
   function imageTags(html) {
     return [...String(html || "").matchAll(/<img\b[^>]*>/gi)].map((tag) => {
-      const source = tag[0].match(/\bsrc\s*=\s*(["'])(.*?)\1/is);
+      const source = tag[0].match(/(?:^|\s)src\s*=\s*(["'])(.*?)\1/is);
       if (!source) throw error("missing_images", "Mỗi thẻ img phải có src trong dấu nháy chứa ảnh thật.");
       return { tag: tag[0], uri: source[2], index: tag.index };
     });
@@ -58,6 +90,10 @@
     let total = 0;
     for (const image of tags) {
       if (allowPlaceholders && /^handbook-image:[1-4]$/.test(image.uri)) continue;
+      if (/^https?:\/\//i.test(image.uri)) {
+        if (!imageHttpUrl(image.uri)) throw error("invalid_image_url", "URL ảnh Cẩm nang cần HTTP(S) công khai trực tiếp, không nội bộ, token, URL tạm hay placeholder.");
+        continue;
+      }
       const info = imageData(image.uri);
       if (!unique.has(image.uri)) { unique.add(image.uri); total += info.length; }
     }
@@ -105,5 +141,5 @@
     get: (id) => transaction("readonly", (table) => table.get(id)),
     remove: (id) => transaction("readwrite", (table) => table.delete(id))
   };
-  globalThis.MedReviewHandbook = { limits, error, bytes, httpUrl, imageData, imageTags, validate, payload, compact, safeError, store };
+  globalThis.MedReviewHandbook = { limits, error, bytes, httpUrl, imageHttpUrl, imageData, imageTags, validate, payload, compact, safeError, store };
 })();
