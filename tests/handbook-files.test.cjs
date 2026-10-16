@@ -244,7 +244,7 @@ test('aborted file resolution never fetches and an in-flight abort never yields 
   await assert.rejects(pending.F.resolve(data(), { ...pending.settings, signal: mid.signal, node: responseRoot({ anchors: [anchor()] }) }), /dừng/);
 });
 
-function previewHarness({ initialText = png, existingPanel = false } = {}) {
+function previewHarness({ initialText = png, existingPanel = false, onOpen, onWait } = {}) {
   let closed = 0, clicked = 0, waits = 0;
   const filename = 'medreview32_link1_base64.txt';
   const panel = element({ 'aria-label': filename, 'data-tab-id': `chatgpt-file:conversation:current-message:1:${filename}` }, { text: initialText,
@@ -259,8 +259,15 @@ function previewHarness({ initialText = png, existingPanel = false } = {}) {
     }
   };
   const button = previewButton(filename);
-  button.click = () => { clicked++; doc.active = [panel]; };
-  const ctx = load({ document: doc, onWait() { waits++; panel.text = png; } });
+  button.click = () => {
+    clicked++; panel.isConnected = true; doc.active = [panel];
+    onOpen?.({ clicked, panel, button, doc });
+  };
+  const ctx = load({ document: doc, onWait(ms, clock) {
+    waits++;
+    if (onWait) onWait({ ms, clock, clicked, panel, button, doc });
+    else panel.text = png;
+  } });
   return { ...ctx, node: responseRoot({ buttons: [button] }), panel,
     stats: () => ({ clicked, closed, waits }) };
 }
@@ -279,6 +286,87 @@ test('a hydrating TXT preview is allowed to finish before size/hash verification
   assert.equal(output.content_html.includes(png), true);
   assert.ok(ctx.stats().waits >= 1);
   assert.equal(ctx.stats().closed, 1);
+});
+
+test('a timed-out TXT preview closes and reopens the same file once before final verification', async () => {
+  const retries = [];
+  const ctx = previewHarness({ initialText: 'Đang tải', onWait() {},
+    onOpen({ clicked, panel }) { if (clicked === 2) panel.text = png; } });
+  const output = await ctx.F.resolve(data(), { ...ctx.settings, node: ctx.node, onRetry: info => retries.push(info) });
+  assert.equal(output.content_html.includes(png), true);
+  assert.equal(ctx.stats().clicked, 2);
+  assert.equal(ctx.stats().closed, 2);
+  assert.ok(ctx.clock.now >= 21500, 'the first preview times out and waits before reopening');
+  assert.equal(retries.length, 1);
+  assert.equal(retries[0].filename, 'link1_base64.txt');
+  assert.equal(retries[0].attempt, 2);
+  assert.equal(retries[0].attempts, 2);
+  assert.equal(ctx.decoded.length, 1, 'only verified bytes from the successful attempt are decoded');
+});
+
+test('TXT preview retry is bounded to two attempts and leaves the original compact result unchanged', async () => {
+  const ctx = previewHarness({ initialText: 'Đang tải', onWait() {} });
+  const input = data();
+  await assert.rejects(ctx.F.resolve(input, { ...ctx.settings, node: ctx.node }), /link1_base64\.txt sau 2 lần thử/);
+  assert.equal(ctx.stats().clicked, 2);
+  assert.equal(ctx.stats().closed, 2);
+  assert.equal(ctx.decoded.length, 0);
+  assert.equal(input.content_html.includes('src="link1"'), true);
+  assert.equal(input.image_files.length, 1);
+});
+
+test('a failed TXT download retries with the refreshed attachment URL from the same reply', async () => {
+  const link = anchor();
+  const refreshedUrl = `${origin}/backend-api/estuary/content?id=refreshed-file`;
+  const ctx = load({
+    fetch: async target => String(target) === url ? new Response('File not ready', { status: 404 }) : new Response(png),
+    onWait() { link.attrs.href = refreshedUrl; link.href = refreshedUrl; }
+  });
+  const output = await ctx.F.resolve(data(), { ...ctx.settings, node: responseRoot({ anchors: [link] }) });
+  assert.equal(output.content_html.includes(png), true);
+  assert.deepEqual(ctx.fetched.map(call => call.url), [url, refreshedUrl]);
+  assert.ok(ctx.fetched.every(call => call.options.cache === 'no-store'));
+});
+
+test('a network failure gets one retry but persistent HTTP failure cannot loop', async () => {
+  let calls = 0;
+  const recovered = load({ fetch: async () => { if (++calls === 1) throw new TypeError('network'); return new Response(png); } });
+  const output = await recovered.F.resolve(data(), { ...recovered.settings, node: responseRoot({ anchors: [anchor()] }) });
+  assert.equal(output.content_html.includes(png), true);
+  assert.equal(calls, 2);
+  const unavailable = load({ fetch: async () => new Response('Busy', { status: 503 }) });
+  await assert.rejects(unavailable.F.resolve(data(), { ...unavailable.settings, node: responseRoot({ anchors: [anchor()] }) }), /sau 2 lần thử/);
+  assert.equal(unavailable.fetched.length, 2);
+  assert.equal(unavailable.decoded.length, 0);
+});
+
+test('hash mismatch is not retried and never reopens the preview', async () => {
+  const ctx = previewHarness();
+  const input = data({ image_files: [descriptor('link1', { sha256: '0'.repeat(64) })] });
+  await assert.rejects(ctx.F.resolve(input, { ...ctx.settings, node: ctx.node }), /SHA-256/);
+  assert.equal(ctx.stats().clicked, 1);
+  assert.equal(ctx.stats().closed, 1);
+  assert.equal(ctx.decoded.length, 0);
+});
+
+test('stopping during the retry delay never reopens the file', async () => {
+  const controller = new AbortController();
+  const ctx = previewHarness({ initialText: 'Đang tải',
+    onWait({ ms }) { if (ms === 1500) controller.abort(); } });
+  await assert.rejects(ctx.F.resolve(data(), { ...ctx.settings, node: ctx.node, signal: controller.signal }), /dừng/);
+  assert.equal(ctx.stats().clicked, 1);
+  assert.equal(ctx.stats().closed, 1);
+  assert.equal(ctx.decoded.length, 0);
+});
+
+test('retry never follows a recycled reply node into another message', async () => {
+  const link = anchor();
+  const node = responseRoot({ anchors: [link] });
+  const ctx = load({ fetch: async () => new Response('Not ready', { status: 404 }),
+    onWait() { node.attrs['data-chatgpt-selection-message-id'] = 'different-message'; } });
+  await assert.rejects(ctx.F.resolve(data(), { ...ctx.settings, node }), /Câu trả lời đã thay đổi/);
+  assert.equal(ctx.fetched.length, 1);
+  assert.equal(ctx.decoded.length, 0);
 });
 
 test('an existing user-owned preview is neither replaced nor closed during attachment resolution', async () => {

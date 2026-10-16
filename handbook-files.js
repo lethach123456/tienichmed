@@ -1,8 +1,9 @@
 // Browser-only attachment transport. Never post file references to MedReview.
 (() => {
   if (globalThis.MedReviewHandbookFiles) return;
-  const fail = (message) => Object.assign(new Error(message), { code: "handbook_image_file", handbookError: true });
+  const fail = (message, details = {}) => Object.assign(new Error(message), { code: "handbook_image_file", handbookError: true, ...details });
   const maxText = Math.ceil(5 * 1024 * 1024 / 3) * 4 + 128;
+  const previewReadTimeout = 20000, previewCloseTimeout = 3000, readAttempts = 2, retryDelay = 1500;
   const check = (signal) => { if (signal?.aborted) throw fail("Đã dừng đọc file ảnh Cẩm nang; chưa gửi bài."); };
   const attr = (node, name) => String(node?.getAttribute?.(name) || "");
   const fileName = (value) => {
@@ -89,7 +90,10 @@
     return url;
   }
   async function readBounded(response, limit, signal) {
-    if (!response.ok || Number(response.headers?.get?.("content-length")) > limit) throw fail("File ảnh tải lỗi hoặc vượt giới hạn.");
+    if (!response.ok) throw fail("Chưa tải được file TXT ảnh từ máy chủ AI.", {
+      retryableAttachmentRead: [403, 404, 408, 410, 425, 429].includes(response.status) || response.status >= 500
+    });
+    if (Number(response.headers?.get?.("content-length")) > limit) throw fail("File TXT ảnh vượt giới hạn.");
     if (!response.body?.getReader) {
       const text = await response.text();
       if (new Blob([text]).size > limit) throw fail("File TXT ảnh vượt giới hạn.");
@@ -115,12 +119,18 @@
     if (depth > 2) throw fail("Link tải file ảnh chuyển hướng quá nhiều.");
     const target = safeUrl(url, options.origin);
     const same = target.origin === new URL(options.origin).origin;
-    const response = await options.fetch(target.href, { signal: options.signal, credentials: same ? "include" : "omit", redirect: "error", referrerPolicy: "no-referrer" });
+    let response;
+    try {
+      response = await options.fetch(target.href, { signal: options.signal, credentials: same ? "include" : "omit", redirect: "error", referrerPolicy: "no-referrer", cache: "no-store" });
+    } catch {
+      check(options.signal);
+      throw fail("Kết nối tải file TXT ảnh bị gián đoạn.", { retryableAttachmentRead: true });
+    }
     const text = await readBounded(response, maxText, options.signal);
     if (text.trim().startsWith("{")) {
       let data;
       try { data = JSON.parse(text); } catch { throw fail("Máy chủ AI không trả file TXT hợp lệ."); }
-      if (typeof data.download_url !== "string") throw fail("Chưa lấy được link tải file TXT từ máy chủ AI.");
+      if (typeof data.download_url !== "string") throw fail("Chưa lấy được link tải file TXT từ máy chủ AI.", { retryableAttachmentRead: true });
       return download(data.download_url, options, depth + 1);
     }
     return text;
@@ -138,7 +148,7 @@
     let opened = null, openedTabId = "";
     try {
       const start = Date.now();
-      while (Date.now() - start < 20000) {
+      while (Date.now() - start < previewReadTimeout) {
         check(options.signal);
         const currentPanels = panels();
         const matches = currentPanels.filter(p => attr(p, "aria-label") === binding.name);
@@ -163,13 +173,36 @@
         }
         await options.wait(200);
       }
-      throw fail(`Chưa đọc được ${binding.entry.filename}; file có thể chưa tạo xong hoặc đã hết hạn.`);
+      throw fail(`Chưa đọc được ${binding.entry.filename}; file có thể chưa tạo xong hoặc đã hết hạn.`, { retryableAttachmentRead: true });
     } finally {
       if (opened && visible(opened) && attr(opened, "aria-label") === binding.name && attr(opened, "data-tab-id") === openedTabId) {
         const close = opened.querySelector("button[aria-label='Đóng trình xem'], button[aria-label='Close viewer']");
         close?.click();
         const closingAt = Date.now();
-        while (visible(opened) && Date.now() - closingAt < 3000) await options.wait(100);
+        while (visible(opened) && Date.now() - closingAt < previewCloseTimeout) await options.wait(100);
+      }
+    }
+  }
+  async function readAttachment(data, entry, owner, replyId, options) {
+    for (let attempt = 1; attempt <= readAttempts; attempt++) {
+      check(options.signal);
+      if (root(owner) !== owner || attr(owner, "data-chatgpt-selection-message-id") !== replyId) {
+        throw fail("Câu trả lời đã thay đổi; chưa mở lại file ảnh của lượt khác.");
+      }
+      // Rebind inside this reply: providers can replace a loading card or refresh its URL.
+      const binding = bindings(data, owner).get(entry.key);
+      if (!binding) throw fail(`Không còn file ${entry.filename} trong câu trả lời hiện tại; chưa gửi bài.`);
+      try {
+        return binding.url ? await download(binding.url, options) : await preview(binding, options);
+      } catch (error) {
+        check(options.signal);
+        if (!error?.retryableAttachmentRead) throw error;
+        if (attempt === readAttempts) {
+          throw fail(`Không đọc được ${entry.filename} sau ${readAttempts} lần thử; file có thể chưa tạo xong hoặc link đã hết hạn. Chưa gửi bài.`);
+        }
+        options.onRetry?.({ filename: entry.filename, attempt: attempt + 1, attempts: readAttempts });
+        check(options.signal);
+        await options.wait(retryDelay);
       }
     }
   }
@@ -195,22 +228,24 @@
     return uri;
   }
   async function resolve(data, settings = {}) {
+    const files = manifest(data);
     const controller = new AbortController();
     const abort = () => controller.abort();
     settings.signal?.addEventListener("abort", abort, { once: true });
     if (settings.signal?.aborted) abort();
-    const timer = setTimeout(abort, 60000);
+    // Each file may need two previews and cleanup; later files get the same retry budget.
+    const timer = setTimeout(abort, Math.max(60000, files.length * (readAttempts * (previewReadTimeout + previewCloseTimeout) + retryDelay) + 10000));
     const options = { origin: globalThis.location?.origin, document: globalThis.document, provider: "", fetch: globalThis.fetch?.bind(globalThis),
       crypto: globalThis.crypto, decodeImage: globalThis.createImageBitmap?.bind(globalThis), wait: ms => new Promise(r => setTimeout(r, ms)), ...settings, signal: controller.signal };
     try {
-      const files = manifest(data), bound = bindings(data, settings.node);
+      const owner = root(settings.node), bound = bindings(data, owner);
+      const replyId = attr(owner, "data-chatgpt-selection-message-id");
       if (bound.size !== files.length) throw fail("Thiếu link tải hoặc thẻ file TXT của chính câu trả lời hiện tại; chưa gửi bài.");
       if (!options.crypto?.subtle || !options.decodeImage) throw fail("Trình duyệt chưa hỗ trợ kiểm tra hash/giải mã ảnh; chưa gửi bài.");
       const replacements = new Map(), hashes = new Set();
       for (const entry of files) {
         check(options.signal);
-        const binding = bound.get(entry.key);
-        const text = binding.url ? await download(binding.url, options) : await preview(binding, options);
+        const text = await readAttachment(data, entry, owner, replyId, options);
         const uri = await verify(text, entry, options);
         if (hashes.has(entry.sha256)) throw fail("Các mã ảnh trùng cùng một file; cần ảnh minh hoạ khác nhau.");
         hashes.add(entry.sha256);

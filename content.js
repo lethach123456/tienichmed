@@ -2191,7 +2191,11 @@ async function prepareHandbookOutput(article, data, previous, responseSnapshot =
     const cancellation = setInterval(() => { if (cancelledArticleId === article.id) controller.abort(); }, 200);
     try {
       if (cancelledArticleId === article.id) controller.abort();
-      data = await MedReviewHandbookFiles.resolve(data, { node: responseSnapshot?.node, provider: PROVIDER, signal: controller.signal });
+      data = await MedReviewHandbookFiles.resolve(data, {
+        node: responseSnapshot?.node, provider: PROVIDER, signal: controller.signal,
+        onRetry: ({ filename, attempt, attempts }) => reportSystemPhase(article.id, article.runToken, "reading-image-files",
+          `Chưa đọc được ${filename}; đang mở lại file lần ${attempt}/${attempts} trước khi báo lỗi.`)
+      });
     } finally { clearInterval(cancellation); }
   }
   MedReviewHandbook.validate(article, data, { allowPlaceholders: true });

@@ -49,6 +49,8 @@ Tiện ích đợi công cụ tạo ảnh và file hoàn tất, chỉ đọc fil
 
 Sau khi cập nhật, Reload tiện ích trong `chrome://extensions`, tải lại tab AI và lấy prompt Cẩm nang mới. Không gỡ cài đặt/xoá dữ liệu hàng đợi.
 
+Nếu trình xem TXT chưa đọc đủ file sau 20 giây, tiện ích tự đóng trình xem do nó mở, chờ 1,5 giây rồi tìm lại đúng thẻ file trong cùng câu trả lời và mở thêm một lần. Lỗi mạng hoặc HTTP tạm thời khi tải TXT cũng được thử lại một lần với link hiện tại. Panel thông báo lượt thử lại; sau hai lần vẫn lỗi thì dừng trước khi gửi website. Bấm Dừng sẽ huỷ việc thử lại; file sai hash/bytes, link không an toàn hoặc trình xem đã chuyển sang file khác vẫn dừng ngay.
+
 ## Viết hồ sơ bác sĩ
 
 Lỗi tải danh sách khác với HTTP 200 `items=[]`: HTTP 503/schema chưa sẵn sàng hiển thị đầy đủ lỗi, trạng thái **Không tải được hồ sơ**, hướng dẫn quản trị và nút **Thử lại**. Nút Chạy bị chặn riêng nguồn bác sĩ của tab đó; không tự retry dồn dập khi mở lại panel, không chuyển sang cơ sở/nguồn khác. JSON, prompt, token/biên nhận và kết quả cũ vẫn được giữ. Khi API sẵn sàng, bấm Thử lại để tải lại danh sách rồi Chạy; hồ sơ đã lưu không tự viết đè.
