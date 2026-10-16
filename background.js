@@ -2011,10 +2011,10 @@ async function publishHandbook(item) {
       error.httpStatus = response.status;
       throw error;
     }
-    if (data.type !== "handbook" || data.id !== Number(item.handbook_id) || data.status !== "draft" ||
+    if (data.type !== "handbook" || data.id !== Number(item.handbook_id) || data.status !== "published" ||
         !Array.isArray(data.images) || !data.images.length || data.images.length > 4 ||
         data.images.some((image) => typeof image.url !== "string" || !image.url.startsWith("/uploads/handbook/") || image.url.includes(".."))) {
-      throw MedReviewHandbook.error("response_unconfirmed", "API chưa xác nhận đúng ID, trạng thái draft và URL ảnh nội bộ Cẩm nang; giữ nguyên payload.");
+      throw MedReviewHandbook.error("response_unconfirmed", "API chưa xác nhận đúng ID, trạng thái xuất bản và URL ảnh nội bộ Cẩm nang; giữ nguyên payload.");
     }
     responseData = data;
     await withSchedulerLock(async () => {
@@ -2030,7 +2030,7 @@ async function publishHandbook(item) {
     });
     // Delete large bytes only AFTER the lightweight success is durable.
     await MedReviewHandbook.store.remove(item.id);
-    return { ok: true, updated: true, status: "draft", images: data.images };
+    return { ok: true, updated: true, status: "published", images: data.images };
   } catch (error) {
     failure = error;
     const message = MedReviewHandbook.safeError(error);
@@ -2064,7 +2064,7 @@ async function completeHandbook(message, sender, result) {
 }
 
 async function retryHandbook(item) {
-  if (item.status === "hoàn tất") throw new Error("Cẩm nang đã lưu nháp; không tự ghi đè.");
+  if (item.status === "hoàn tất") throw new Error("Cẩm nang đã xuất bản; không tự ghi đè.");
   if (["already_claimed", "lease_lost", "not_eligible", "source_revision_changed", "idempotency_conflict"].includes(item.handbook_error_code)) {
     throw new Error("Bài hoặc quyền giữ Cẩm nang đã thay đổi. JSON được giữ để đối chiếu; không nhận khóa khác để gửi đè.");
   }

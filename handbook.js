@@ -119,7 +119,7 @@
   function compact(result, response) {
     const { id, title, language, excerpt, seo_title, seo_description, sources_json } = result;
     return { id, title, language, excerpt, seo_title, seo_description, sources_json,
-      status: response?.status || "draft", images: response?.images || [], images_count: response?.images_count || 0 };
+      status: response?.status || "published", images: response?.images || [], images_count: response?.images_count || 0 };
   }
   let database;
   const db = () => database || (database = new Promise((resolve, reject) => {

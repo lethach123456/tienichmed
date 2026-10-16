@@ -593,7 +593,7 @@ function promptDebugLabel(item) {
 function displayJobStatus(item) {
   const status = item?.status || "chờ";
   if (articleSource(item) === "handbook") {
-    if (status === "hoàn tất") return "đã lưu nháp · chưa xuất bản";
+    if (status === "hoàn tất") return "đã xuất bản · bài Cẩm nang đã lên website";
     if (["missing_images", "image_decode_failed", "image_mime_mismatch", "image_too_large"].includes(item.handbook_error_code)) return "thiếu hoặc lỗi file minh hoạ AI";
     if (item.handbook_error_code === "handbook_capability_error") return "AI chưa cung cấp file ảnh thật";
     if (["source_revision_changed", "not_eligible", "idempotency_conflict", "lease_lost"].includes(item.handbook_error_code)) return "chủ đề/quyền giữ đã đổi · cần đối chiếu";
@@ -825,7 +825,7 @@ function renderApiStatus() {
     const sendingElapsed = item.status === "đang cập nhật" ? elapsedLabel(item.api_request_started_at) : "";
     const translatedStatus = String(item.api_update?.status || item.api_update?.translation?.status || "").toLowerCase();
     const savedDraft = translationJob && (!translatedStatus || ["draft", "nháp", "saved_draft", "success", "ok"].includes(translatedStatus));
-    const detail = handbookJob && success ? `Đã lưu Cẩm nang nháp · ${item.api_update?.images_count || 0} ảnh nội bộ · chưa xuất bản` : imageFixPartial ? imageFixErrorDetail(item) : success
+    const detail = handbookJob && success ? `Đã xuất bản Cẩm nang · ${item.api_update?.images_count || 0} ảnh nội bộ` : imageFixPartial ? imageFixErrorDetail(item) : success
       ? imageFixJob ? imageFixSuccessMessage(item) : translationJob ? `${savedDraft ? "Đã lưu bản dịch nháp" : "Đã lưu bản dịch"}${item.api_update?.slug ? ` · ${item.api_update.slug}` : ""}${item.api_update?.translation_id != null ? ` · ID ${item.api_update.translation_id}` : ""}${Array.isArray(item.api_update?.saved_fields) ? ` · ${item.api_update.saved_fields.length} trường` : ""}` : doctorJob ? (isDoctorInsufficient(item) ? "Đã lưu nghiên cứu thiếu dữ liệu · hoàn tất, không tự viết lại" : "Đã lưu hồ sơ bác sĩ · chờ duyệt") : `${imageJob ? "Đã gửi ảnh AI thành công" : "Đã gửi thành công"}${updateCount != null ? ` · ${updateCount} mục` : ""}${imageProgress}${imageErrors.length ? ` · ${imageErrors.length} ảnh chưa xếp hàng` : ""}`
       : item.status === "đang cập nhật" ? `${imageFixJob ? "Website đang tải/lưu ảnh" : imageJob ? "Đang gửi ảnh AI" : "Đang gửi website"}${sendingElapsed ? ` · ${sendingElapsed}` : ""} · JSON đã lưu`
         : uncertain ? `${item.api_error || "Chưa có xác nhận sau 30 phút"} JSON vẫn được lưu.`

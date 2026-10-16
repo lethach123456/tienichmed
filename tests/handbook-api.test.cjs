@@ -38,7 +38,7 @@ function load(initial = {}, override) {
       if (options.method === "POST" && String(url).includes("handbooks-needing-content.php")) {
         return response({ ok: true, claimed: true, claim_token: token, source_revision: revision, lease_seconds: 600, server_now: Math.floor(Date.now() / 1000), expires_at: Math.floor(Date.now() / 1000) + 600 });
       }
-      if (options.method === "POST") return response({ ok: true, type: "handbook", id: 9, status: "draft", images_count: 1, images: [{ url: "/uploads/handbook/9/ai-test.jpg", ai_generated: true }] });
+      if (options.method === "POST") return response({ ok: true, type: "handbook", id: 9, status: "published", images_count: 1, images: [{ url: "/uploads/handbook/9/ai-test.jpg", ai_generated: true }] });
       return response({ ok: true, contract_version: 1, claim_endpoint: "/api/medical/handbooks-needing-content.php", receive_endpoint: "/api/medical/handbook-content-update.php",
         items: [{ id: 9, title: "Chủ đề", language: "vi", source_revision: revision, prompt: "SERVER PROMPT giữ nguyên", output_template: {} }] });
     }
@@ -144,7 +144,7 @@ test("handbook claim stale revision is not treated as someone else's successful 
   const ctx = load({}, (call, reply) => call.body?.action === "claim" ? reply({ ok: false, reason: "source_revision_changed", message: "Chủ đề sửa" }, 409) : null);
   await assert.rejects(ctx.api.requestWriterClaim("claim", job(), { requestId: "stable-request", client: {} }), /409/);
 });
-test("handbook completion uses a single-object POST and only retains response URLs after durable draft success", async () => {
+test("handbook completion uses a single-object POST and only retains response URLs after durable publish success", async () => {
   const ctx = load();
   const original = result();
   const saved = await ctx.api.handleArticleComplete({ articleId: job().id, runToken: "run-one", article: original }, ctx.sender);
